@@ -75,6 +75,11 @@ Operators can inspect the current pending digest window via `/digestpreview [gro
 - **Behavior**: `/broadcast` confirmations are bound to the issuing operator, the chat in which they were issued, and the action (confirm or cancel). Each identity is consumed on first use.
 - **Pending List & Explicit Cancellation**: Operators in private chat can inspect their active pending confirmations with `/broadcast list` (or `/confirmations`) and explicitly cancel an action by ID (`/broadcast cancel <id>`, `/confirmations cancel <id>`, `/confirmations cancel all`, or via the inline cancel button). The pending confirmation store and listing are bounded to `MAX_PENDING_CONFIRMATIONS` (20 entries, oldest evicted at capacity). Listings show only the current operator's unexpired actions with remaining time and expiry timestamp, and report only destination counts so target chat IDs or other operators' actions are never exposed.
 - **Restarts**: When `BROADCAST_CONFIRMATION_STORE_PATH` is set, identities survive restarts. Replayed or expired confirmations are rejected after a restart. Without it, pending confirmations are lost on restart and are rejected as unknown.
+- **Expired Callbacks & Recovery Hints**: When an operator interacts with an expired broadcast confirmation or cancellation callback, the callback query is acknowledged exactly once with a localized alert dialog (`ctx.answerCallbackQuery`) and the prompt message is updated with a localized recovery hint directing the authorized operator to recreate the action via `/broadcast`.
+
+### Pause Confirmations
+- **Behavior**: Operator `/pause` commands require inline confirmation. The callback verifies operator authorization and enforces a TTL (`PAUSE_CONFIRM_TTL_MS`, 5 minutes).
+- **Expired Callbacks & Recovery Hints**: If the pause confirmation prompt expires before the operator confirms, the callback is acknowledged exactly once with a localized alert dialog and the prompt message is updated with a recovery hint directing the operator to run `/pause` again. Failed message edits (such as deleted prompt messages) do not trigger duplicate callback acknowledgments.
 
 ### Cursor Management and Restarts
 - **Behavior**: The cursor (the last ingested event's ledger sequence and ID) is persisted to `CURSOR_FILE` after events are dispatched.
