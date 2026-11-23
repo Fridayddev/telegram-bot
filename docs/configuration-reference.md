@@ -24,6 +24,7 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 
 ### Network Settings
 - `STELLAR_RPC_URL`: The Soroban RPC endpoint used to poll for events. (e.g., `https://soroban-testnet.stellar.org`).
+- `STELLAR_RPC_EGRESS_ALLOWLIST`: Optional comma-separated list of allowed RPC egress hosts, wildcards, or origins (e.g., `soroban-testnet.stellar.org,*.stellar.org`). When set, both initial RPC URLs and HTTP redirect destinations are validated against the allowlist, while credential-free loopback URLs (`127.0.0.1`, `localhost`, `::1`) remain permitted in `MIMIR_PROFILE=mock`.
 - `STELLAR_HORIZON_URL`: Used for generating transaction links.
 - `STELLAR_EXPLORER_BASE_URL`: Explorer origin for transaction links (default `https://stellar.expert/explorer`). Only `https:` origins become clickable links in notifications; see [notification-links.md](notification-links.md).
 - `STELLAR_NETWORK_PASSPHRASE`: Must match the RPC network's passphrase.
@@ -41,19 +42,11 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 - For full details on defaults, evaluation precedence, and worked examples, see [Notification Filters](notification-filters.md).
 - **Zero active routes**: When every configured route is disabled (`NOTIFY_ENABLED=false`, or both `NOTIFY_MARKET` and `NOTIFY_SQUAD` set to `false`), the notifier reports an explicit `no-active-routes` status instead of a healthy delivery status. No notification is ever reported as delivered in this state; each would-be event is counted as suppressed and logged at warn level with the reason `no active routes`.
 
-### Routing Preview (Dry Run)
-Routing previews report which Telegram destinations an event would be delivered to, without calling Telegram `sendMessage`. The preview uses the same decision path as live notification delivery, so it returns:
-- **matched**: destinations that would receive the notification.
-- **filtered**: destinations excluded by `NOTIFY_ENABLED`, `NOTIFY_MARKET`, `NOTIFY_SQUAD`, `NOTIFY_CATEGORIES` (and aliases), or other notification filters.
-- **unavailable**: destinations that cannot currently receive messages (for example, a missing or unconfigured `TELEGRAM_CHAT_ID`).
-
-Previews are read-only: they perform no Telegram API calls, do not advance the cursor, and do not write to `CURSOR_FILE`. A preview does not guarantee delivery; the live path remains the authority for what is actually sent.
-
-### Operator Digest Preview
-Operators can inspect the current pending digest window via `/digestpreview [grouped|flat]` (backed by `previewPendingDigest` in `src/notifications/digest-preview.ts` and the optional `digestWindow` dependency on `CommandDeps`).
-- **Live builder, non-consuming**: renders pending events through `formatDigest` without draining or mutating the pending window (for example, `DeferredQueue.peek()`), so subsequent scheduled flushes still receive all pending events.
-- **Operator authorization**: protected by the existing `OPERATOR_TELEGRAM_USER_ID` gate (`operatorOnly: true`, `hidden: true`). Non-operators and deployments without `OPERATOR_TELEGRAM_USER_ID` are silently ignored without reading the pending window.
-- **Completeness & schedule**: preserves period completeness metadata (`rpc_gap`, `restart`) and displays the next scheduled digest timestamp when provided.
+### Dead-Letter Queue Capacity Gauge
+The dead-letter queue (DLQ) capacity gauge reports how full the failed-notification queue is, as a bounded value. It exposes only counts: `used` (current entries) and `max` (configured maximum entries). Message bodies, chat IDs and payload contents are never included.
+- **Output**: `dead_letter_capacity_used` and `dead_letter_capacity_max` gauges, plus a derived `dead_letter_capacity_utilization` ratio in the range `0`–`1` (`used / max`, clamped to `1`).
+- **Queue disabled**: When the dead-letter queue is disabled, `max` reports `0`, `used` reports `0`, and utilization reports `0`. The gauges are still registered so dashboards do not break; no entries are ever recorded and no alert should fire on them.
+- **Zero-capacity guard**: If `max` is `0` while the queue is enabled, utilization is reported as `0` rather than dividing by zero.
 
 ### Health Reporting
 - `HEALTH_HOST` & `HEALTH_PORT`: Binds a local HTTP endpoint for health probes (e.g., Kubernetes liveness probes). Set port to 0 to disable.
@@ -75,6 +68,11 @@ Operators can inspect the current pending digest window via `/digestpreview [gro
 - **Behavior**: `/broadcast` confirmations are bound to the issuing operator, the chat in which they were issued, and the action (confirm or cancel). Each identity is consumed on first use.
 - **Pending List & Explicit Cancellation**: Operators in private chat can inspect their active pending confirmations with `/broadcast list` (or `/confirmations`) and explicitly cancel an action by ID (`/broadcast cancel <id>`, `/confirmations cancel <id>`, `/confirmations cancel all`, or via the inline cancel button). The pending confirmation store and listing are bounded to `MAX_PENDING_CONFIRMATIONS` (20 entries, oldest evicted at capacity). Listings show only the current operator's unexpired actions with remaining time and expiry timestamp, and report only destination counts so target chat IDs or other operators' actions are never exposed.
 - **Restarts**: When `BROADCAST_CONFIRMATION_STORE_PATH` is set, identities survive restarts. Replayed or expired confirmations are rejected after a restart. Without it, pending confirmations are lost on restart and are rejected as unknown.
+- **Expired Callbacks & Recovery Hints**: When an operator interacts with an expired broadcast confirmation or cancellation callback, the callback query is acknowledged exactly once with a localized alert dialog (`ctx.answerCallbackQuery`) and the prompt message is updated with a localized recovery hint directing the authorized operator to recreate the action via `/broadcast`.
+
+### Pause Confirmations
+- **Behavior**: Operator `/pause` commands require inline confirmation. The callback verifies operator authorization and enforces a TTL (`PAUSE_CONFIRM_TTL_MS`, 5 minutes).
+- **Expired Callbacks & Recovery Hints**: If the pause confirmation prompt expires before the operator confirms, the callback is acknowledged exactly once with a localized alert dialog and the prompt message is updated with a recovery hint directing the operator to run `/pause` again. Failed message edits (such as deleted prompt messages) do not trigger duplicate callback acknowledgments.
 
 ### Cursor Management and Restarts
 - **Behavior**: The cursor (the last ingested event's ledger sequence and ID) is persisted to `CURSOR_FILE` after events are dispatched.
