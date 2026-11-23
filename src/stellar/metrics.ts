@@ -18,6 +18,9 @@
  * that clamping happened without any unbounded label cardinality.
  */
 
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import path from "node:path";
+
 export type RpcOperation = "health" | "events";
 
 /** Bounded set of reasons a sample's duration was dropped/clamped. */
@@ -724,4 +727,190 @@ export function formatServiceLevelWindow(report: ServiceLevelWindowReport): stri
     `delivery_success=${succ} attempts=${report.delivery.attempts} ` +
     `avg_lag=${avgLag} max_lag=${maxLag} gaps=${report.dataGap.totalGaps}`
   );
+}
+
+// ── Versioned metrics reset marker ────────────────────────────────────────────
+
+/** Fixed schema identifier for the persisted metrics reset marker file. */
+export const METRICS_RESET_MARKER_SCHEMA = "mimir.metrics-reset-marker" as const;
+
+/** Current schema version for the persisted metrics reset marker file. */
+export const METRICS_RESET_MARKER_VERSION = 1 as const;
+
+/**
+ * Versioned marker persisted across restarts so operators can distinguish
+ * an in-process counter reset (process restart) from a real activity drop.
+ */
+export interface MetricsResetMarker {
+  schema: typeof METRICS_RESET_MARKER_SCHEMA;
+  version: typeof METRICS_RESET_MARKER_VERSION;
+  /** Monotonically increasing restart/reset generation (>= 1). */
+  generation: number;
+  /** Unix epoch timestamp in milliseconds when this generation started. */
+  resetAtMs: number;
+  /** ISO-8601 UTC timestamp when this generation started. */
+  resetAt: string;
+}
+
+/** Result of parsing a raw metrics reset marker JSON string. */
+export type ParseMetricsResetMarkerResult =
+  | { ok: true; marker: MetricsResetMarker }
+  | { ok: false; reason: "invalid_json" | "invalid_schema" | "unsupported_version" | "invalid_generation" | "invalid_timestamp" };
+
+/** Result of advancing (loading, incrementing, and persisting) the reset marker. */
+export interface MetricsResetMarkerResult {
+  marker: MetricsResetMarker;
+  /** True when the new generation was successfully persisted to disk. */
+  persisted: boolean;
+  /** Non-fatal warning if a previous marker was corrupt/unsupported or writing failed. */
+  warning?: string;
+}
+
+export interface AdvanceMetricsResetMarkerOptions {
+  /** Clock returning Unix epoch milliseconds (defaults to `Date.now`). */
+  now?: (() => number) | undefined;
+}
+
+/**
+ * Parse and validate a versioned metrics reset marker payload.
+ */
+export function parseMetricsResetMarker(raw: string): ParseMetricsResetMarkerResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { ok: false, reason: "invalid_json" };
+  }
+
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, reason: "invalid_schema" };
+  }
+
+  const record = parsed as Record<string, unknown>;
+  if (record.schema !== METRICS_RESET_MARKER_SCHEMA) {
+    return { ok: false, reason: "invalid_schema" };
+  }
+
+  if (record.version !== METRICS_RESET_MARKER_VERSION) {
+    return { ok: false, reason: "unsupported_version" };
+  }
+
+  if (
+    typeof record.generation !== "number" ||
+    !Number.isInteger(record.generation) ||
+    record.generation < 1 ||
+    !Number.isSafeInteger(record.generation)
+  ) {
+    return { ok: false, reason: "invalid_generation" };
+  }
+
+  if (
+    typeof record.resetAtMs !== "number" ||
+    !Number.isFinite(record.resetAtMs) ||
+    record.resetAtMs < 0
+  ) {
+    return { ok: false, reason: "invalid_timestamp" };
+  }
+
+  const resetAtMs = Math.trunc(record.resetAtMs);
+  const resetAt =
+    typeof record.resetAt === "string" && record.resetAt.length > 0
+      ? record.resetAt
+      : new Date(resetAtMs).toISOString();
+
+  return {
+    ok: true,
+    marker: {
+      schema: METRICS_RESET_MARKER_SCHEMA,
+      version: METRICS_RESET_MARKER_VERSION,
+      generation: record.generation,
+      resetAtMs,
+      resetAt,
+    },
+  };
+}
+
+/**
+ * Create an in-memory versioned metrics reset marker for a given generation.
+ */
+export function createMetricsResetMarker(
+  generation: number,
+  nowMs: number = Date.now(),
+): MetricsResetMarker {
+  const safeGen =
+    Number.isInteger(generation) && generation >= 1 && Number.isSafeInteger(generation)
+      ? generation
+      : 1;
+  const safeMs = Number.isFinite(nowMs) && nowMs >= 0 ? Math.trunc(nowMs) : Date.now();
+  return {
+    schema: METRICS_RESET_MARKER_SCHEMA,
+    version: METRICS_RESET_MARKER_VERSION,
+    generation: safeGen,
+    resetAtMs: safeMs,
+    resetAt: new Date(safeMs).toISOString(),
+  };
+}
+
+/**
+ * Load an existing versioned metrics reset marker from `filePath`, increment its
+ * generation, and atomically persist the new marker.
+ *
+ * Failure & boundary behavior:
+ *  - Missing file (`ENOENT`): starts at generation `1` and writes the file.
+ *  - Corrupt JSON, wrong schema, unsupported version, or invalid generation:
+ *    recovers cleanly by starting at generation `1`, records a `warning`, and
+ *    overwrites the file with a valid marker.
+ *  - Unwritable path / filesystem error: never throws; returns the in-memory
+ *    marker with `persisted: false` and a `warning`.
+ */
+export function advanceMetricsResetMarkerSync(
+  filePath: string,
+  options?: AdvanceMetricsResetMarkerOptions,
+): MetricsResetMarkerResult {
+  const nowFn = options?.now ?? (() => Date.now());
+  const nowMs = nowFn();
+
+  let nextGeneration = 1;
+  let warning: string | undefined;
+
+  try {
+    const raw = readFileSync(filePath, "utf8");
+    const parsed = parseMetricsResetMarker(raw);
+    if (parsed.ok) {
+      nextGeneration = parsed.marker.generation + 1;
+    } else {
+      warning = `reset_marker_${parsed.reason}`;
+      nextGeneration = 1;
+    }
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | null)?.code;
+    if (code !== "ENOENT") {
+      warning = `reset_marker_read_error:${code ?? "unknown"}`;
+    }
+    nextGeneration = 1;
+  }
+
+  const marker = createMetricsResetMarker(nextGeneration, nowMs);
+  const payload = JSON.stringify(marker, null, 2) + "\n";
+
+  try {
+    mkdirSync(path.dirname(filePath), { recursive: true });
+    const tmpPath = `${filePath}.tmp.${process.pid}`;
+    writeFileSync(tmpPath, payload, "utf8");
+    renameSync(tmpPath, filePath);
+    return warning ? { marker, persisted: true, warning } : { marker, persisted: true };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | null)?.code;
+    const writeWarn = `reset_marker_write_error:${code ?? "unknown"}`;
+    return {
+      marker,
+      persisted: false,
+      warning: warning ? `${warning};${writeWarn}` : writeWarn,
+    };
+  }
+}
+
+/** One-line, secret-free metrics reset marker summary for logs and status output. */
+export function formatMetricsResetMarker(marker: MetricsResetMarker): string {
+  return `metrics_reset version=${marker.version} generation=${marker.generation} reset_at=${marker.resetAt}`;
 }

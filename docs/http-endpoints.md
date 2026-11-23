@@ -418,6 +418,8 @@ The metrics registry tracks:
 | `mimir_bot_notification_age_ms_total` | counter | Cumulative end-to-end age (ms) from ledger close time to confirmed send |
 | `mimir_bot_last_notification_age_ms` | gauge | End-to-end age (ms) of the most recent confirmed notification with a known ledger time |
 | `mimir_bot_max_notification_age_ms` | gauge | Maximum observed end-to-end notification age (ms) across confirmed sends |
+| `mimir_bot_reset_generation` | gauge | Monotonically increasing versioned reset generation persisted across restarts (`METRICS_RESET_FILE`, default `./data/metrics-reset.json`); increments on each process start so operators can distinguish a restart from a real activity drop |
+| `mimir_bot_reset_timestamp_seconds` | gauge | Unix timestamp (seconds) when the current metrics reset generation started |
 
 > **Note:** Missing ledger close times increment `mimir_bot_notification_age_missing_ledger_time_total` without incrementing `mimir_bot_notification_age_samples_total` or overwriting `mimir_bot_last_notification_age_ms`, distinguishing absent chain timestamps from `0` ms delivery lag.
 

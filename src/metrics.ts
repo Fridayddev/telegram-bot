@@ -26,8 +26,17 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { Socket } from "node:net";
+
+const DEFAULT_HEALTH_SHUTDOWN_GRACE_MS = 2_000;
 import {
   DEFAULT_SERVICE_LEVEL_WINDOW_SIZE,
+  METRICS_RESET_MARKER_SCHEMA,
+  METRICS_RESET_MARKER_VERSION,
+  type AdvanceMetricsResetMarkerOptions,
+  type MetricsResetMarker,
+  type MetricsResetMarkerResult,
+  type ParseMetricsResetMarkerResult,
   type ServiceLevelCompleteness,
   type ServiceLevelDataGap,
   type ServiceLevelDeliverySuccess,
@@ -37,11 +46,21 @@ import {
   type ServiceLevelWindowOptions,
   type ServiceLevelWindowReport,
   ServiceLevelWindow,
+  advanceMetricsResetMarkerSync,
+  createMetricsResetMarker,
+  formatMetricsResetMarker,
   formatServiceLevelWindow,
+  parseMetricsResetMarker,
 } from "./stellar/metrics.js";
 
 export {
   DEFAULT_SERVICE_LEVEL_WINDOW_SIZE,
+  METRICS_RESET_MARKER_SCHEMA,
+  METRICS_RESET_MARKER_VERSION,
+  type AdvanceMetricsResetMarkerOptions,
+  type MetricsResetMarker,
+  type MetricsResetMarkerResult,
+  type ParseMetricsResetMarkerResult,
   type ServiceLevelCompleteness,
   type ServiceLevelDataGap,
   type ServiceLevelDeliverySuccess,
@@ -51,7 +70,11 @@ export {
   type ServiceLevelWindowOptions,
   type ServiceLevelWindowReport,
   ServiceLevelWindow,
+  advanceMetricsResetMarkerSync,
+  createMetricsResetMarker,
+  formatMetricsResetMarker,
   formatServiceLevelWindow,
+  parseMetricsResetMarker,
 };
 
 // ── Metric types ──────────────────────────────────────────────────────────────
@@ -180,6 +203,20 @@ export interface MetricsRegistry {
   lastNotificationAgeMs: Gauge;
   /** Maximum observed end-to-end notification age in ms across confirmed sends. */
   maxNotificationAgeMs: Gauge;
+  /**
+   * Monotonically increasing metrics reset generation persisted across restarts.
+   * Increments on each process start so operators can distinguish a restart from
+   * a real activity drop.
+   */
+  resetGeneration: Gauge;
+  /** Unix timestamp in seconds when the current metrics reset generation began. */
+  resetTimestampSeconds: Gauge;
+
+  /** Return a copy of the active versioned metrics reset marker. */
+  resetMarker(): MetricsResetMarker;
+
+  /** Return any non-fatal warning from loading or persisting the reset marker. */
+  resetMarkerWarning(): string | undefined;
 
   /**
    * Record one confirmed notification's end-to-end age in milliseconds, or `null`
@@ -301,9 +338,26 @@ function makeLabeledCounter(name: string, help: string, labels: readonly string[
 export interface MetricsOptions {
   /** Optional capacity of the bounded rolling service-level window. */
   serviceLevelWindowSize?: number | undefined;
+  /**
+   * Optional path to a versioned JSON file persisting the metrics reset
+   * generation across restarts. When omitted, the registry starts at
+   * generation 1 in-memory without touching the filesystem.
+   */
+  resetMarkerFile?: string | undefined;
+  /** Optional clock returning Unix epoch ms for deterministic reset timestamps. */
+  now?: (() => number) | undefined;
 }
 
 export function createMetrics(options?: MetricsOptions): MetricsRegistry {
+  const markerResult: MetricsResetMarkerResult =
+    typeof options?.resetMarkerFile === "string" && options.resetMarkerFile.length > 0
+      ? advanceMetricsResetMarkerSync(options.resetMarkerFile, { now: options.now })
+      : {
+          marker: createMetricsResetMarker(1, options?.now ? options.now() : Date.now()),
+          persisted: false,
+        };
+  const activeResetMarker = markerResult.marker;
+  const activeResetMarkerWarning = markerResult.warning;
   const droppedSamples = makeLabeledCounter(
     `${METRICS_PREFIX}dropped_samples_total`,
     "Metric samples dropped before exposure, by bounded reason.",
@@ -395,6 +449,16 @@ export function createMetrics(options?: MetricsOptions): MetricsRegistry {
     `${METRICS_PREFIX}max_notification_age_ms`,
     "Maximum observed end-to-end notification age in milliseconds from ledger close time to confirmed send.",
   );
+  const resetGeneration = makeGauge(
+    `${METRICS_PREFIX}reset_generation`,
+    "Monotonically increasing metrics reset generation persisted across restarts (distinguishes restarts from real activity drops).",
+  );
+  const resetTimestampSeconds = makeGauge(
+    `${METRICS_PREFIX}reset_timestamp_seconds`,
+    "Unix timestamp in seconds when the current metrics reset generation started.",
+  );
+  resetGeneration.set(activeResetMarker.generation);
+  resetTimestampSeconds.set(Math.floor(activeResetMarker.resetAtMs / 1000));
 
   const counters = [
     pollCycles,
@@ -419,6 +483,8 @@ export function createMetrics(options?: MetricsOptions): MetricsRegistry {
     activityBaselineEvents,
     lastNotificationAgeMs,
     maxNotificationAgeMs,
+    resetGeneration,
+    resetTimestampSeconds,
   ];
 
   const baseFailedInc = notificationsFailed.inc;
@@ -666,6 +732,14 @@ export function createMetrics(options?: MetricsOptions): MetricsRegistry {
     notificationAgeTotalMs,
     lastNotificationAgeMs,
     maxNotificationAgeMs,
+    resetGeneration,
+    resetTimestampSeconds,
+    resetMarker(): MetricsResetMarker {
+      return { ...activeResetMarker };
+    },
+    resetMarkerWarning(): string | undefined {
+      return activeResetMarkerWarning;
+    },
     recordNotificationAge,
     serviceLevel,
     serviceLevelReport(): ServiceLevelWindowReport {
