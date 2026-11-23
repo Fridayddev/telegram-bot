@@ -369,11 +369,14 @@ export interface PollerStatus {
   /** In-memory cursor state is newer than the persisted file. */
   pendingFlush: boolean;
   lastFlushAt: number | null;
-  /**
-   * Repetitive error lines withheld by the sampler since start. They are
+  /** Repetitive error lines withheld by the sampler since start. They are
    * summarized in the log rather than dropped; surfaced here for `/status`.
    */
   suppressedLogs: number;
+  /** Active recovery generation of cursor persistence. */
+  recoveryGeneration?: number;
+  /** Flags for unsupported contract version combinations detected before start. */
+  unsupportedVersions?: Array<{ source: string; version: string; fallback: string; reason: string }>;
   /** Dead-letter queue counters (see src/deadLetter.ts). */
   deadLetter: DeadLetterStats;
   /** Fixed-provider, fixed-bucket RPC latency snapshot for `/metrics`. */
@@ -446,8 +449,14 @@ export interface CursorFile {
    * it, so the on-disk format stays version 1 either way.
    */
   chainClockAt?: number | null;
-  /** Optional network identifier for backup ownership validation. */
-  network?: string;
+  /**
+   * Monotonically non-decreasing generation counter representing the recovery
+   * epoch of this cursor. Older backups carry a strictly lower generation than
+   * the active state, allowing startup rollback detection.
+   */
+  recoveryGeneration?: number;
+  /** True when an operator explicitly acknowledged intended replay for this state. */
+  replayAcknowledged?: boolean;
   targets: Record<string, CursorTarget>;
   /**
    * Bounded history of cursor recovery actions (floor rewinds, operator
@@ -1349,6 +1358,10 @@ export function parseCursorFile(raw: string): CursorFile {
     // Additive field: only present when the file carried it.
     ...(parsed.chainClockAt !== undefined ? { chainClockAt: parseChainClock(parsed.chainClockAt) } : {}),
     targets,
+    ...(typeof parsed.recoveryGeneration === "number" && Number.isSafeInteger(parsed.recoveryGeneration) && parsed.recoveryGeneration >= 0
+      ? { recoveryGeneration: parsed.recoveryGeneration }
+      : {}),
+    ...(parsed.replayAcknowledged === true ? { replayAcknowledged: true } : {}),
     ...(recoveryHistory.length > 0 ? { recoveryHistory } : {}),
   };
 }
@@ -1503,6 +1516,12 @@ export function parseAndMigrateCursorFile(
         ? parsed.updatedAt
         : nowIso;
     const file: CursorFile = { version: CURSOR_SCHEMA_VERSION, updatedAt, targets };
+    if (typeof parsed.recoveryGeneration === "number" && Number.isSafeInteger(parsed.recoveryGeneration) && parsed.recoveryGeneration >= 0) {
+      file.recoveryGeneration = parsed.recoveryGeneration;
+    }
+    if (parsed.replayAcknowledged === true) {
+      file.replayAcknowledged = true;
+    }
     if (parsed.chainClockAt !== undefined) file.chainClockAt = parseChainClock(parsed.chainClockAt);
     if (parsed.recoveryHistory !== undefined) {
       const recoveryHistory = parseRecoveryHistory(parsed.recoveryHistory);
@@ -1606,12 +1625,18 @@ export function buildCursorFile(
   updatedAt: string,
   chainClockAt?: number | null,
   recoveryHistory?: readonly CursorRecoveryRecord[],
+  recoveryGeneration?: number,
+  replayAcknowledged?: boolean,
 ): CursorFile {
   const boundedHistory =
     recoveryHistory !== undefined ? parseRecoveryHistory(recoveryHistory) : [];
   return {
     version: CURSOR_SCHEMA_VERSION,
     updatedAt,
+    ...(typeof recoveryGeneration === "number" && Number.isSafeInteger(recoveryGeneration) && recoveryGeneration >= 0
+      ? { recoveryGeneration }
+      : {}),
+    ...(replayAcknowledged === true ? { replayAcknowledged: true } : {}),
     ...(chainClockAt !== undefined ? { chainClockAt } : {}),
     targets: Object.fromEntries(
       [...targets].map((t) => [
@@ -1631,6 +1656,176 @@ export function buildCursorFile(
     ),
     ...(boundedHistory.length > 0 ? { recoveryHistory: boundedHistory } : {}),
   };
+}
+
+/**
+ * Snapshot of cursor backup metadata used to detect startup rollbacks to an
+ * older cursor backup. Monotonically non-decreasing recovery generation
+ * ensures regressed state is identified across backup-and-restore actions.
+ */
+export interface CursorBackupMetadata {
+  version: number;
+  recoveryGeneration: number;
+  updatedAt: string;
+  chainClockAt?: number | null;
+  targets: Record<string, { cursor?: string | null; lastEventLedger?: number | null }>;
+}
+
+export function cursorBackupMetadataPath(cursorFile: string): string {
+  return `${cursorFile}.backup-meta.json`;
+}
+
+export async function writeBackupMetadata(
+  cursorFile: string,
+  metadata: CursorBackupMetadata,
+): Promise<void> {
+  const metaPath = cursorBackupMetadataPath(cursorFile);
+  const tmp = `${metaPath}.tmp-${process.pid}-${randomUUID()}`;
+  await mkdir(path.dirname(metaPath), { recursive: true });
+  await writeFile(tmp, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+  await rename(tmp, metaPath);
+}
+
+export async function readBackupMetadata(cursorFile: string): Promise<CursorBackupMetadata | null> {
+  const metaPath = cursorBackupMetadataPath(cursorFile);
+  try {
+    const raw = await readFile(metaPath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      const recoveryGeneration =
+        typeof parsed.recoveryGeneration === "number" &&
+        Number.isSafeInteger(parsed.recoveryGeneration) &&
+        parsed.recoveryGeneration >= 0
+          ? parsed.recoveryGeneration
+          : 0;
+      return {
+        version: typeof parsed.version === "number" ? parsed.version : 1,
+        recoveryGeneration,
+        updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : "",
+        chainClockAt: typeof parsed.chainClockAt === "number" ? parsed.chainClockAt : null,
+        targets: parsed.targets && typeof parsed.targets === "object" ? parsed.targets : {},
+      };
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      Logger.warn("poller", `[poller] unreadable backup metadata at ${metaPath}: ${safeErrorMessage(err)}`);
+    }
+  }
+
+  const bakPath = `${cursorFile}.bak`;
+  try {
+    const rawBak = await readFile(bakPath, "utf8");
+    const parsedBak = parseAndMigrateCursorFile(rawBak);
+    return {
+      version: parsedBak.file.version,
+      recoveryGeneration: parsedBak.file.recoveryGeneration ?? 0,
+      updatedAt: parsedBak.file.updatedAt,
+      chainClockAt: parsedBak.file.chainClockAt,
+      targets: Object.fromEntries(
+        Object.entries(parsedBak.file.targets).map(([k, v]) => [
+          k,
+          { cursor: v.cursor, lastEventLedger: v.lastEventLedger },
+        ]),
+      ),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export interface RollbackDetectionResult {
+  rollback: boolean;
+  reason?: string;
+  cursorGeneration?: number;
+  backupGeneration?: number;
+  regressedTargets?: Array<{
+    source: string;
+    cursorLedger: number | null;
+    backupLedger: number | null;
+  }>;
+}
+
+export function detectCursorRollback(
+  cursor: CursorFile,
+  backupMeta: CursorBackupMetadata | null,
+): RollbackDetectionResult {
+  if (!backupMeta) {
+    return { rollback: false };
+  }
+
+  const cursorGen = typeof cursor.recoveryGeneration === "number" ? cursor.recoveryGeneration : 0;
+  const backupGen = typeof backupMeta.recoveryGeneration === "number" ? backupMeta.recoveryGeneration : 0;
+
+  // 1. Monotonic recovery generation check:
+  if (cursorGen < backupGen) {
+    return {
+      rollback: true,
+      reason: `cursor recovery generation (${cursorGen}) is older than backup metadata (${backupGen})`,
+      cursorGeneration: cursorGen,
+      backupGeneration: backupGen,
+    };
+  }
+
+  // 2. Target position regression check within the same recovery generation:
+  if (cursorGen === backupGen && backupMeta.targets) {
+    const regressedTargets: Array<{
+      source: string;
+      cursorLedger: number | null;
+      backupLedger: number | null;
+    }> = [];
+
+    for (const [source, backupTarget] of Object.entries(backupMeta.targets)) {
+      const liveTarget = cursor.targets[source];
+      if (!liveTarget) continue;
+
+      const backupLedger =
+        backupTarget.lastEventLedger ??
+        (backupTarget.cursor ? eventCursorLedger(backupTarget.cursor) : null);
+      const liveLedger =
+        liveTarget.lastEventLedger ??
+        (liveTarget.cursor ? eventCursorLedger(liveTarget.cursor) : null);
+
+      if (typeof backupLedger === "number" && (liveLedger === null || liveLedger < backupLedger)) {
+        regressedTargets.push({
+          source,
+          cursorLedger: liveLedger,
+          backupLedger,
+        });
+      }
+    }
+
+    if (regressedTargets.length > 0) {
+      const detail = regressedTargets
+        .map((t) => `${t.source}: ledger ${t.cursorLedger ?? "none"} < backup ${t.backupLedger}`)
+        .join(", ");
+      return {
+        rollback: true,
+        reason: `cursor target positions regressed behind backup metadata (${detail})`,
+        cursorGeneration: cursorGen,
+        backupGeneration: backupGen,
+        regressedTargets,
+      };
+    }
+  }
+
+  return { rollback: false, cursorGeneration: cursorGen, backupGeneration: backupGen };
+}
+
+export class CursorRollbackError extends Error {
+  readonly cursorGeneration: number | null;
+  readonly backupGeneration: number | null;
+  readonly details: string;
+
+  constructor(
+    message: string,
+    options?: { cursorGeneration?: number | null; backupGeneration?: number | null; details?: string },
+  ) {
+    super(message);
+    this.name = "CursorRollbackError";
+    this.cursorGeneration = options?.cursorGeneration ?? null;
+    this.backupGeneration = options?.backupGeneration ?? null;
+    this.details = options?.details ?? "";
+  }
 }
 
 function isNonNegativeSafeInteger(value: unknown): value is number {
@@ -2067,6 +2262,8 @@ export function createPoller(deps: PollerDeps) {
 
   /** Bounded history of cursor recovery actions persisted alongside cursors. */
   let recoveryHistory: CursorRecoveryRecord[] = [];
+  /** Monotonic recovery generation counter tracking the active recovery epoch. */
+  let currentRecoveryGeneration = 1;
 
   // Per-contract redelivery guard. Kept out of `TargetState` so status output
   // stays plain data; the window is internal bookkeeping.
@@ -2185,6 +2382,7 @@ export function createPoller(deps: PollerDeps) {
     running: false,
     paused: false,
     stopping: false,
+    recoveryGeneration: currentRecoveryGeneration,
     chainClockAt: null,
     startedAt: 0,
     cycles: 0,
@@ -2481,7 +2679,59 @@ export function createPoller(deps: PollerDeps) {
       const result = parseAndMigrateCursorFile(raw, { now: () => new Date(now()) });
       status.cursorLoadError = null;
       const parsed = result.file;
-      let fingerprintMigrated = false;
+      const loadedGeneration = parsed.recoveryGeneration ?? 0;
+      currentRecoveryGeneration = Math.max(1, loadedGeneration);
+      status.recoveryGeneration = currentRecoveryGeneration;
+
+      // Rollback detection against backup metadata:
+      const backupMeta = await readBackupMetadata(config.cursorFile);
+      const rollbackCheck = detectCursorRollback(parsed, backupMeta);
+
+      if (rollbackCheck.rollback) {
+        const replayAllowed = config.acknowledgeCursorReplay || parsed.replayAcknowledged === true;
+        if (!replayAllowed) {
+          const detail = rollbackCheck.reason ?? "cursor state is older than backup metadata";
+          const err = new CursorRollbackError(
+            `[poller] cursor rollback detected: ${detail}. ` +
+              `Startup aborted to prevent unintended event replay. ` +
+              `To proceed, set ACKNOWLEDGE_CURSOR_REPLAY=true or restore with --ack-replay.`,
+            {
+              cursorGeneration: rollbackCheck.cursorGeneration,
+              backupGeneration: rollbackCheck.backupGeneration,
+              details: detail,
+            },
+          );
+          audit.record(
+            auditEntry("cursor_rollback_rejected", {
+              detail: `${detail} (cursorGen=${rollbackCheck.cursorGeneration ?? 0}, backupGen=${rollbackCheck.backupGeneration ?? 0})`,
+            }),
+          );
+          throw err;
+        }
+
+        const backupGen = rollbackCheck.backupGeneration ?? 0;
+        currentRecoveryGeneration = Math.max(currentRecoveryGeneration, backupGen) + 1;
+        status.recoveryGeneration = currentRecoveryGeneration;
+        markDirty();
+        pendingRewrite = true;
+        Logger.warn(
+          "poller",
+          `[poller] cursor rollback acknowledged; proceeding with replay ` +
+            `(${rollbackCheck.reason}); advancing to recovery generation ${currentRecoveryGeneration}`,
+          {
+            action: "cursor_rollback_acknowledged",
+            cursorGeneration: rollbackCheck.cursorGeneration,
+            backupGeneration: rollbackCheck.backupGeneration,
+            nextGeneration: currentRecoveryGeneration,
+          },
+        );
+        audit.record(
+          auditEntry("cursor_rollback_acknowledged", {
+            detail: `${rollbackCheck.reason} (nextGen=${currentRecoveryGeneration})`,
+          }),
+        );
+      }
+
       for (const [source, saved] of Object.entries(parsed.targets)) {
         const key = source as ContractSource;
         const target = state.get(key);
@@ -2577,8 +2827,13 @@ export function createPoller(deps: PollerDeps) {
         },
       );
     } catch (err) {
+      if (err instanceof CursorRollbackError) {
+        throw err;
+      }
       // Quarantine then cold-start: never wedge on a corrupt state file, and
       // keep the bad bytes for operators instead of overwriting them on save.
+      currentRecoveryGeneration += 1;
+      status.recoveryGeneration = currentRecoveryGeneration;
       const reason = errorMessage(err);
       status.cursorLoadError = {
         kind: "corrupt",
@@ -2619,6 +2874,8 @@ export function createPoller(deps: PollerDeps) {
       new Date(now()).toISOString(),
       status.chainClockAt,
       recoveryHistory,
+      currentRecoveryGeneration,
+      false,
     );
 
     try {
@@ -2633,6 +2890,23 @@ export function createPoller(deps: PollerDeps) {
       // older than the primary — a crash here leaves the primary intact.
       const backupFile = `${config.cursorFile}.bak`;
       await copyFile(config.cursorFile, backupFile);
+      try {
+        const meta: CursorBackupMetadata = {
+          version: payload.version,
+          recoveryGeneration: currentRecoveryGeneration,
+          updatedAt: payload.updatedAt,
+          chainClockAt: payload.chainClockAt,
+          targets: Object.fromEntries(
+            Object.entries(payload.targets).map(([k, v]) => [
+              k,
+              { cursor: v.cursor, lastEventLedger: v.lastEventLedger },
+            ]),
+          ),
+        };
+        await writeBackupMetadata(config.cursorFile, meta);
+      } catch (metaErr) {
+        Logger.warn("poller", `[poller] could not persist backup metadata: ${errorMessage(metaErr)}`);
+      }
       status.pendingFlush = false;
       status.lastFlushAt = now();
       pendingRewrite = false;
@@ -3267,6 +3541,8 @@ export function createPoller(deps: PollerDeps) {
     current.cursor = null;
     current.lastEventLedger = null;
     current.rewindFromLedger = window.oldestLedger;
+    currentRecoveryGeneration += 1;
+    status.recoveryGeneration = currentRecoveryGeneration;
     recoveryHistory = appendCursorRecoveryHistory(recoveryHistory, {
       at: new Date(at).toISOString(),
       reason: "floor_rewind",

@@ -19,7 +19,6 @@
 import { InlineKeyboard, type Bot, type Context } from "grammy";
 import type { InlineKeyboardMarkup } from "grammy/types";
 
-import { messagesFor } from "./i18n.js";
 import {
   handleBroadcastCallback,
   handleConfirmationsCallback,

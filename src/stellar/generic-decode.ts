@@ -18,7 +18,6 @@
  */
 
 import { scValToNative, type rpc, type xdr } from "@stellar/stellar-sdk";
-import type { EventQuarantine } from "./quarantine.js";
 
 // ── Bounded Limits ───────────────────────────────────────────────────────────
 
@@ -824,11 +823,94 @@ export function decodeGenericEvent(
       ? (event as { topics: unknown[] }).topics
       : [];
 
-  const eventName = rawTopics.length > 0 ? extractEventName(rawTopics[0]) : "unknown";
+  // Validate topic count before accessing variant positions or parsing payload.
+  if (!hasTopicArray || rawTopics.length === 0 || rawTopics.length > maxTopics) {
+    const reason = !hasTopicArray
+      ? "missing or invalid topic array"
+      : rawTopics.length === 0
+        ? "empty topic array"
+        : `topic count ${rawTopics.length} exceeds maximum of ${maxTopics}`;
+    const summary = `[unknown] (malformed: ${reason})`;
+    return {
+      source,
+      contractId,
+      ledger,
+      txHash,
+      at,
+      eventId,
+      eventType,
+      transactionIndex,
+      operationIndex,
+      inSuccessfulContractCall,
+      eventName: "unknown",
+      topics: [],
+      value: "void",
+      topicSummary: "(none)",
+      valueSummary: "void",
+      summary,
+      status: "malformed_event",
+      reason,
+      payload: {
+        name: "generic",
+        eventName: "unknown",
+        topics: [],
+        value: "void",
+        summary,
+        reason,
+      },
+    };
+  }
+
+  const eventName = extractEventName(rawTopics[0]);
+
   const maxDepth = options?.maxDepth ?? MAX_GENERIC_DEPTH;
-  const depthExceeded =
-    scValCollectionDepth(event.value, maxDepth) > maxDepth ||
-    rawTopics.some((topic) => scValCollectionDepth(topic, maxDepth) > maxDepth);
+  let duplicateCollision: DuplicateMapKeyCollision | null = null;
+  for (const t of rawTopics) {
+    duplicateCollision = findDuplicateMapKey(t, maxDepth);
+    if (duplicateCollision) break;
+  }
+  if (!duplicateCollision) {
+    duplicateCollision = findDuplicateMapKey(event.value, maxDepth);
+  }
+
+  if (duplicateCollision) {
+    const reason = boundDiagnostic(duplicateCollision.reason);
+    const topics = renderTopics(rawTopics, options);
+    const value = `malformed:${reason}`;
+    const topicSummary = topics.length > 0 ? topics.join(" | ") : "(none)";
+    const valueSummary = value;
+    const summary = `[${eventName}] ${topicSummary} => ${valueSummary}`;
+
+    return {
+      source,
+      contractId,
+      ledger,
+      txHash,
+      at,
+      eventId,
+      eventType,
+      transactionIndex,
+      operationIndex,
+      inSuccessfulContractCall,
+      eventName,
+      topics,
+      value,
+      topicSummary,
+      valueSummary,
+      summary,
+      status: "malformed_event",
+      reason,
+      payload: {
+        name: "unknown",
+        eventName,
+        topics,
+        value,
+        summary,
+        reason,
+      },
+    };
+  }
+
   const topics = renderTopics(rawTopics, options);
   const value = renderGenericScVal(event.value, 0, options);
 
