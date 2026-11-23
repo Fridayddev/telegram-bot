@@ -30,7 +30,7 @@
 
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
-import { redactText } from "./redact.js";
+import { redactText, stripTerminalEscapes } from "./redact.js";
 
 /** Placeholder substituted for every redacted span. */
 export const REDACTED = "●●●";
@@ -92,7 +92,7 @@ export function redactLine(text: string, secrets: string[]): string {
   // Shortened display forms like `CDV6…LPKZI` are left alone; the ellipsis
   // means there is nothing more to hide.
   out = out.replace(/\b[GC][A-Z2-7]{55}\b/g, (m) => `${m.slice(0, 4)}…${m.slice(-4)}`);
-  return out;
+  return stripTerminalEscapes(out);
 }
 
 /** Derive the literal substrings that must never survive into the buffer. */
@@ -344,7 +344,7 @@ function redactLogText(text: string): string {
     secrets: state.secrets,
     maxLen: Number.MAX_SAFE_INTEGER,
   });
-  return out.replace(TELEGRAM_TOKEN_SHAPE, LOG_REDACTED);
+  return stripTerminalEscapes(out.replace(TELEGRAM_TOKEN_SHAPE, LOG_REDACTED));
 }
 
 function boundField(text: string): string {

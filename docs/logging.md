@@ -126,6 +126,7 @@ Every log record is redacted before it leaves the process via the shared redacti
 2. **Credential Patterns**: Telegram bot tokens (`bot<digits>:<token>` and `<digits>:<token>`), Stellar `S…` seed strkeys, URL userinfo and credential-bearing query parameters, `Bearer …` headers, and `TOKEN=`/`SECRET=`/`PASSWORD=`/`AUTHORIZATION:` key-value pairs are automatically replaced with `[REDACTED]`.
 3. **URL Redaction**: Internal helpers (`redactUrl`) mask HTTP basic auth or query credentials in URLs before logging.
 4. **All Fields Protected**: Redaction applies recursively to both the log `msg` and all string values in custom `fields`.
+5. **Terminal Escape Neutralization**: ANSI/CSI, OSC (including hyperlinks and title-spoofing payloads), DCS/APC control strings, and other C0/C1 control sequences (except `\t` and `\n`) are stripped via `stripTerminalEscapes` before emitting human-readable `text` logs, structured `json` fields, or captured `/export` log lines, while preserving ordinary Unicode content.
 
 ### Redaction Policy Self-Check (`npm run doctor`)
 `npm run doctor` runs a `redaction-policy` self-check that passes synthetic secret probes (registered secret, Telegram bot token, Stellar seed strkey, URL userinfo/query credentials, Bearer token, and env key-value secret) through all configured log formats (`text`, `json`). If any probe leaks, the check fails and reports only the leaked field names—never the probe values or raw log lines.

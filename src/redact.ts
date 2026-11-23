@@ -26,6 +26,42 @@
 export const REDACTED = "[REDACTED]";
 
 /**
+ * Terminal escape and control sequence patterns:
+ *  - OSC (`ESC ] ... BEL/ST` or 8-bit `0x9d ...`), including unterminated OSC
+ *  - DCS/SOS/PM/APC control strings (`ESC P/X/^/_ ... ST` or 8-bit equivalents)
+ *  - CSI / ANSI sequences (`ESC [ ... final` or 8-bit `0x9b ...`)
+ *  - 2-byte / nF ESC sequences (`ESC ... final`, e.g. `ESC c` terminal reset)
+ *  - Remaining C0/C1 control characters except `\t` (0x09) and `\n` (0x0a)
+ *
+ * Ordinary Unicode (accented Latin, CJK, Arabic, Hebrew, emoji, punctuation)
+ * sits at U+00A0 and above and is preserved verbatim.
+ */
+const TERMINAL_ESCAPE_PATTERN = new RegExp(
+  [
+    // OSC (Operating System Command): ESC ] ... (BEL | ST | end)
+    "(?:\\x1b\\]|\\x9d)[^\\x07\\x1b\\x9c]*(?:\\x07|\\x1b\\\\|\\x9c|$)",
+    // DCS, SOS, PM, APC control strings: ESC P/X/^/_ ... (ST | end)
+    "(?:\\x1b[PX^_]|[\\x90\\x98\\x9e\\x9f])[^\\x1b\\x9c]*(?:\\x1b\\\\|\\x9c|$)",
+    // CSI (Control Sequence Introducer): ESC [ params intermediates final?
+    "(?:\\x1b\\[|\\x9b)[\\x30-\\x3f]*[\\x20-\\x2f]*[\\x40-\\x7e]?",
+    // Other ESC sequences (e.g. ESC c, ESC ( B)
+    "\\x1b[\\x20-\\x2f]*[\\x30-\\x7e]",
+    // Remaining C0/C1 controls except tab (\x09) and newline (\x0a)
+    "[\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f]",
+  ].join("|"),
+  "g",
+);
+
+/**
+ * Strip ANSI/CSI, OSC, and other terminal control sequences from untrusted text
+ * while preserving ordinary Unicode content, tabs, and newlines.
+ */
+export function stripTerminalEscapes(input: string): string {
+  if (!input) return "";
+  return input.replace(TERMINAL_ESCAPE_PATTERN, "");
+}
+
+/**
  * Default cap for redacted error text. Matches `safeErrorMessage`'s historical
  * bound so this module is a drop-in for the callers that already rely on it.
  */
