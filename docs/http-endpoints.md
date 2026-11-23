@@ -314,6 +314,18 @@ The `mimir_telegram_latest_ledger` and `mimir_telegram_target_last_event_ledger`
 lines are omitted when no ledger has been observed yet (cold start or no
 events seen).
 
+**Label validation and escaping**: All Prometheus label keys and values emitted
+by `src/metrics.ts`, `src/stellar/metrics.ts`, and `src/health.ts` are validated
+before exposition:
+
+- Label keys must match `/^[a-zA-Z_][a-zA-Z0-9_]*$/` and must not start with the
+  reserved `__` prefix; malformed keys throw `MetricLabelError` before any bytes
+  are emitted.
+- Label values escape backslashes (`\` -> `\\`), double quotes (`"` -> `\"`), and
+  line feeds (`\n` -> `\n`) per Prometheus text format v0.0.4, while rejecting
+  disallowed C0/DEL/C1 control characters (`\r`, `\0`, `\t`, ANSI ESC `\x1b`,
+  etc.) with `MetricLabelError` (`CONTROL_CHARACTER_IN_LABEL_VALUE`).
+
 ```bash
 curl -s http://127.0.0.1:8787/metrics
 
@@ -421,7 +433,21 @@ The metrics registry tracks:
 | `mimir_bot_reset_generation` | gauge | Monotonically increasing versioned reset generation persisted across restarts (`METRICS_RESET_FILE`, default `./data/metrics-reset.json`); increments on each process start so operators can distinguish a restart from a real activity drop |
 | `mimir_bot_reset_timestamp_seconds` | gauge | Unix timestamp (seconds) when the current metrics reset generation started |
 
-> **Note:** Missing ledger close times increment `mimir_bot_notification_age_missing_ledger_time_total` without incrementing `mimir_bot_notification_age_samples_total` or overwriting `mimir_bot_last_notification_age_ms`, distinguishing absent chain timestamps from `0` ms delivery lag.
+#### Registration contract
+
+The registry exposes a `register(name, type, help)` method (see
+`MetricsRegistry` in `src/metrics.ts`). It guards against duplicate registration
+corrupting the exposition output:
+
+- **First call** for a name creates and stores the metric.
+- **Identical re-registration** (same `name`, `type`, and `help`) returns the
+  existing live metric unchanged — safe for module-level init code that runs
+  more than once.
+- **Conflicting re-registration** (same `name`, different `type` or `help`)
+  throws `MetricRegistrationError` so a mismatch is caught at construction
+  time rather than producing a `# TYPE`/`# HELP` line that disagrees with the
+  value line. The error exposes `metricName`, `field` (`"type"` | `"help"`),
+  `existing`, and `attempted` for programmatic inspection.
 
 ```bash
 METRICS_PORT=9090  # in .env or environment
