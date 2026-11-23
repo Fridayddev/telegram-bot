@@ -44,7 +44,7 @@ const MENU = [
   "filters",
   "health",
   "preview",
-  "categories",
+  "stats",
   "pause",
   "resume",
   "follow",

@@ -282,6 +282,7 @@ async function main(): Promise<void> {
     status: () => poller.status(),
     recentEvents: () => poller.recentEvents(),
     audit,
+    metrics,
     pause: () => poller.pause(),
     resume: () => poller.resume(),
     logs: logCapture,

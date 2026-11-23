@@ -18,7 +18,7 @@ const PUBLIC_LINES = [
   "/filters — Active notification filters and routing",
   "/health — Health assessment and operational readiness",
   "/preview — Preview channel notification formatting",
-  "/categories — Observed claim categories and counts",
+  "/stats — Notification and RPC counters with process uptime",
 ];
 const ALL_LINES = [
   ...PUBLIC_LINES.slice(0, 5),

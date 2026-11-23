@@ -86,6 +86,7 @@ export {
   pauseMessage,
   RecentEventStore,
   resumeMessage,
+  statsMessage,
   statusMessage,
   toCanonicalEventSummary,
   type CanonicalEventSummary,

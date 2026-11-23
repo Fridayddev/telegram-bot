@@ -28,7 +28,7 @@ import "./contracts.js";
 import "./filters.js";
 import "./health.js";
 import "./preview.js";
-import "./categories.js";
+import "./stats.js";
 import "./pause.js";
 import "./resume.js";
 import "./follow.js";
@@ -109,11 +109,11 @@ export { menuCommand, menuKeyboard, menuMessage } from "./menu.js";
 export { pauseCommand, pauseMessage, PAUSE_PROMPT } from "./pause.js";
 export { previewCommand } from "./preview.js";
 export {
-  CategoryCounter,
-  categoriesCommand,
-  categoriesMessage,
-  createCategoryCounter,
-} from "./categories.js";
+  statsCommand,
+  statsMessage,
+  statsSnapshotFromDeps,
+  type StatsSnapshot,
+} from "./stats.js";
 export { resumeCommand, resumeMessage } from "./resume.js";
 export { lastEventMessage, statusCommand, statusMessage } from "./status.js";
 export {

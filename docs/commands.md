@@ -15,7 +15,7 @@
 | `/filters` | Active notification filters and routing | No | No |
 | `/health` | Health assessment and operational readiness | No | Yes |
 | `/preview` | Preview channel notification formatting | No | Yes |
-| `/categories` | Observed claim categories and counts | No | Yes |
+| `/stats` | Notification and RPC counters with process uptime | No | Yes |
 | `/pause` | Operator only: pause new scans | Yes | No |
 | `/resume` | Operator only: resume polling now | Yes | No |
 | `/follow` | Subscribe this chat to a market or squad ref | No | No |
