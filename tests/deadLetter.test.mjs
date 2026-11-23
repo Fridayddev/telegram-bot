@@ -30,6 +30,7 @@ async function withQueue(run, options = {}) {
     filePath,
     maxEntries: options.maxEntries ?? 3,
     maxAttempts: options.maxAttempts ?? 3,
+    secrets: options.secrets,
     now: () => clock,
   });
   try {
@@ -123,6 +124,63 @@ test("an unknown schema version is treated as corrupt, not parsed", async () => 
     await queue.load();
     assert.equal(queue.stats().depth, 0);
   });
+});
+
+test("legacy entries without a correlation id still load and replay", async () => {
+  await withQueue(async ({ queue, filePath }) => {
+    const legacy = {
+      id: "legacy-entry",
+      enqueuedAt: "2026-01-01T00:00:00.000Z",
+      source: "market",
+      ledger: 42,
+      eventName: "claim_cancelled",
+      text: "cancelled message",
+      attempts: 1,
+      lastError: null,
+    };
+    await writeFile(
+      filePath,
+      JSON.stringify({ version: 1, updatedAt: "", entries: [legacy] }),
+      "utf8",
+    );
+    await queue.load();
+    assert.equal(queue.snapshot()[0].correlationId, undefined);
+
+    const replayed = [];
+    await queue.flush(async (_text, entry) => replayed.push(entry.correlationId), 1);
+    assert.deepEqual(replayed, [undefined]);
+  });
+});
+
+test("loaded entries redact errors and bound remote metadata", async () => {
+  await withQueue(async ({ queue, filePath }) => {
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        updatedAt: "",
+        entries: [{
+          id: "hand-edited",
+          enqueuedAt: "",
+          source: "market" + "x".repeat(100),
+          ledger: 42,
+          eventName: "claim_cancelled" + "y".repeat(100),
+          correlationId: "evt_0123456789abcdef01234567",
+          text: "hand-edited message",
+          attempts: 1,
+          lastError: `Telegram failed for bot${BOT_TOKEN}`,
+        }],
+      }),
+      "utf8",
+    );
+
+    await queue.load();
+    const entry = queue.snapshot()[0];
+    assert.equal(entry.source.length, 32);
+    assert.equal(entry.eventName.length, 80);
+    assert.equal(entry.lastError.includes(BOT_TOKEN), false);
+    assert.match(entry.lastError, /\[REDACTED\]/);
+  }, { secrets: [BOT_TOKEN] });
 });
 
 test("entries that are not shaped like entries are dropped on load", async () => {
@@ -376,6 +434,7 @@ test("a stored error is bounded even when redaction shortens it", async () => {
 test("an unwritable queue logs and degrades instead of throwing", async () => {
   const warnings = [];
   const errors = [];
+  const correlationId = "evt_0123456789abcdef01234567";
   mock.method(console, "warn", (...args) => warnings.push(args.join(" ")));
   mock.method(console, "error", (...args) => errors.push(args.join(" ")));
   try {
@@ -386,11 +445,15 @@ test("an unwritable queue logs and degrades instead of throwing", async () => {
       maxAttempts: 3,
     });
     await queue.load();
-    const entry = await queue.enqueue(parked(1));
+    const entry = await queue.enqueue({ ...parked(1), correlationId });
     assert.equal(entry.ledger, 1, "the entry is still queued in memory");
     assert.equal(queue.stats().depth, 1);
     assert.equal(
       errors.some((line) => line.includes("could not persist queue")),
+      true,
+    );
+    assert.equal(
+      errors.some((line) => line.includes(`correlation=${correlationId}`)),
       true,
     );
     assert.equal(

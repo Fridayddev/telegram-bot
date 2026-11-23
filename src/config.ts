@@ -58,7 +58,8 @@ import {
   type Locale,
 } from "./i18n.js";
 import { DEFAULT_SILENT_EVENTS, KNOWN_EVENT_NAMES } from "./notifications/priority.js";
-import { DEFAULT_MAX_RESPONSE_BYTES } from "./stellar/rpc-guard.js";
+import { parseSchedule } from "./notifications/schedule.js";
+import { DEFAULT_DIGEST_MAX_PENDING } from "./notifications/digest-checkpoint.js";
 
 /** Named Stellar networks the bot understands. `custom` is any other passphrase. */
 export type StellarNetwork = "testnet" | "mainnet" | "futurenet" | "custom";
@@ -179,6 +180,11 @@ export interface StellarConfig {
   squadContractId: string;
   marketContractVersion: string;
   squadContractVersion: string;
+  /**
+   * Configured Soroban RPC endpoint. Used to place requests and check the
+   * network passphrase; latency metrics attribute it to a fixed provider
+   * identity, never to this URL.
+   */
   rpcUrl: string;
   /** Optional operator-configured RPC egress allowlist (hosts, wildcards, or origins). */
   rpcEgressAllowlist?: string[];
@@ -200,6 +206,11 @@ export interface TelegramRoute {
   /** The contract source this route delivers; determines which events it carries. */
   source: "market" | "squad" | "default";
   chatId: string;
+  /**
+   * Optional Telegram forum topic (message_thread_id). Distinguishes separate
+   * topics within the same chat in operator route diagnostics.
+   */
+  topicId?: string;
   channelPreviewMode: boolean;
   /** Previous group chat id recorded when Telegram migrated the chat to a supergroup. */
   migratedFromChatId?: string;
@@ -276,6 +287,8 @@ export type RouteDeliveryStatus =
 export function resolveRouteDeliveryStatus(
   routes: ReadonlyArray<TelegramRoute & { enabled?: boolean }>,
 ): RouteDeliveryStatus {
+  // Topic identifiers are carried on each route (TelegramRoute.topicId) so
+  // operator diagnostics can distinguish forum topics within one chat.
   const activeRouteCount = routes.filter((route) => route.enabled !== false).length;
   if (activeRouteCount === 0) {
     return {
@@ -309,7 +322,11 @@ export interface BotConfig extends StellarConfig {
   categoryForumTopics?: Record<string, number | null>;
   /** Chats allowed to use /status. Empty array means no restriction. */
   allowedChatIds: string[];
-  /** Telegram user id allowed to run operator-only commands. Null disables them. */
+  /**
+   * Telegram user id allowed to run operator-only commands. Null disables them.
+   * It also scopes the privileged command menu to that user's private chat;
+   * authorization is still checked on every update.
+   */
   operatorTelegramUserId: string | null;
   pollIntervalMs: number;
   startLookbackLedgers: number;
@@ -352,6 +369,16 @@ export interface BotConfig extends StellarConfig {
   deadLetterMaxAttempts: number;
   /** Maximum retention age (ms) for parked sends before expiry. */
   deadLetterMaxAgeMs?: number;
+  /**
+   * Optional scheduled digest cadence (`daily@HH:mm` or `weekly@day HH:mm` in
+   * UTC). When set, notifiable events are buffered in a bounded checkpoint and
+   * delivered as a grouped digest on schedule instead of per-event.
+   */
+  digestSchedule?: string | null;
+  /** Path to the bounded scheduled-digest checkpoint file. */
+  digestCheckpointFile?: string;
+  /** Maximum pending events retained in the digest checkpoint between runs. */
+  digestMaxPending?: number;
   /**
    * Crash-safe send journal: intent is logged before a Telegram send and done
    * after, so a restart can tell which notifications may have been sent
@@ -396,12 +423,24 @@ export interface BotConfig extends StellarConfig {
   routeCooldownMs?: number;
   /** When true, notifications sent to Telegram are formatted in preview mode. */
   channelPreviewMode: boolean;
+  /**
+   * Explicit acknowledgement of intended replay when rolling back to an older cursor backup.
+   * Required to start the poller if the loaded cursor is older than backup metadata.
+   */
+  acknowledgeCursorReplay: boolean;
   /** Show Telegram link previews on market notifications (LINK_PREVIEW_MARKET). */
   linkPreviewMarket: boolean;
   /** Show Telegram link previews on squad notifications (LINK_PREVIEW_SQUAD). */
   linkPreviewSquad: boolean;
   /** Per-chat notification preferences. Optional; absent means the single chat route. */
   routes?: TelegramRoute[];
+  /**
+   * Per-destination digest interval in milliseconds, keyed by chat id
+   * (DIGEST_INTERVAL_MS, e.g. `chatA=60000,chatB=300000`). Bounded to
+   * [DIGEST_INTERVAL_MIN_MS, DIGEST_INTERVAL_MAX_MS]. Critical notifications
+   * are never delayed by digest timing. Empty means no digest scheduling.
+   */
+  digestIntervalsMs?: Readonly<Record<string, number>>;
   /**
    * Identical RPC/poller error lines allowed per key per sampling window.
    * Repeats beyond this are counted and reported as one summary line.
@@ -423,6 +462,11 @@ export interface BotConfig extends StellarConfig {
   mimirAppUrl: string | null;
   /** Optional bearer token for health endpoint authentication. Null disables auth. The server rejects Authorization headers over 4096 UTF-8 bytes before comparison. */
   healthAuthToken: string | null;
+  /**
+   * Path to the JSON file backing the follow store. When absent the /follow,
+   * /unfollow, and /follows commands reply with a "not configured" message.
+   */
+  followFile?: string | undefined;
 }
 
 /** Fallback drain budget when a config object predates `SHUTDOWN_TIMEOUT_MS`. */
@@ -474,7 +518,8 @@ const DEFAULTS = {
   deadLetterFile: "./data/dead-letter.json",
   deadLetterMax: 100,
   deadLetterMaxAttempts: 10,
-  deadLetterMaxAgeMs: 7 * 24 * 60 * 60 * 1_000,
+  digestCheckpointFile: "./data/digest-checkpoint.json",
+  digestMaxPending: DEFAULT_DIGEST_MAX_PENDING,
   sendJournalFile: "./data/send-journal.jsonl",
   healthHost: "127.0.0.1",
   healthPort: 8787,
@@ -493,6 +538,7 @@ const DEFAULTS = {
   telegramSendTimeoutMs: DEFAULT_TELEGRAM_SEND_TIMEOUT_MS,
   routeCooldownMs: DEFAULT_ROUTE_COOLDOWN_MS,
   channelPreviewMode: false,
+  acknowledgeCursorReplay: false,
   linkPreviewMarket: false,
   linkPreviewSquad: false,
   logSampleMaxPerWindow: 3,
@@ -501,6 +547,8 @@ const DEFAULTS = {
   // an outage that lasts for hours.
   logSampleWindowMs: 300_000,
   logBufferLines: 500,
+  atomFeedEnabled: false,
+  atomFeedMaxEntries: 50,
 } as const;
 
 /**
@@ -683,12 +731,13 @@ function collector(profile: Record<string, string>) {
     url(name: string, fallback: string): string {
       const value = get(name) ?? fallback;
       try {
-        const parsed = new URL(value);
-        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-          problems.push(`${name} must be an http(s) URL; got "${value}"`);
+        assertRpcEndpointUrl(value, name);
+      } catch (err) {
+        if (err instanceof RpcEndpointUrlError) {
+          problems.push(err.message);
+        } else {
+          problems.push(`${name} is not a valid URL`);
         }
-      } catch {
-        problems.push(`${name} is not a valid URL; got "${value}"`);
       }
       return value;
     },
@@ -697,12 +746,13 @@ function collector(profile: Record<string, string>) {
       const value = read(name);
       if (value === undefined) return null;
       try {
-        const parsed = new URL(value);
-        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-          problems.push(`${name} must be an http(s) URL; got "${value}"`);
+        assertRpcEndpointUrl(value, name);
+      } catch (err) {
+        if (err instanceof RpcEndpointUrlError) {
+          problems.push(err.message);
+        } else {
+          problems.push(`${name} is not a valid URL`);
         }
-      } catch {
-        problems.push(`${name} is not a valid URL; got "${value}"`);
       }
       return value;
     },
@@ -1145,6 +1195,19 @@ export function loadConfig(): BotConfig {
     );
   }
 
+  const digestScheduleInput = read("DIGEST_SCHEDULE");
+  let digestSchedule: string | null = null;
+  if (digestScheduleInput !== undefined) {
+    try {
+      parseSchedule(digestScheduleInput);
+      digestSchedule = digestScheduleInput;
+    } catch (err) {
+      c.problems.push(
+        `DIGEST_SCHEDULE is invalid: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   const config: BotConfig = {
     ...stellar,
     locale: locale ?? DEFAULT_LOCALE,
@@ -1194,11 +1257,12 @@ export function loadConfig(): BotConfig {
       DEFAULTS.deadLetterMaxAttempts,
       1,
     ),
-    deadLetterMaxAgeMs: c.int(
-      "DEAD_LETTER_MAX_AGE_MS",
-      DEFAULTS.deadLetterMaxAgeMs,
-      1,
+    digestSchedule,
+    digestCheckpointFile: path.resolve(
+      process.cwd(),
+      c.get("DIGEST_CHECKPOINT_FILE") ?? DEFAULTS.digestCheckpointFile,
     ),
+    digestMaxPending: c.int("DIGEST_MAX_PENDING", DEFAULTS.digestMaxPending, 1),
     sendJournalFile: path.resolve(
       process.cwd(),
       read("SEND_JOURNAL_FILE") ?? DEFAULTS.sendJournalFile,
@@ -1235,6 +1299,7 @@ export function loadConfig(): BotConfig {
       0,
     ),
     channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),
+    acknowledgeCursorReplay: c.bool("ACKNOWLEDGE_CURSOR_REPLAY", DEFAULTS.acknowledgeCursorReplay),
     linkPreviewMarket: c.bool("LINK_PREVIEW_MARKET", DEFAULTS.linkPreviewMarket),
     linkPreviewSquad: c.bool("LINK_PREVIEW_SQUAD", DEFAULTS.linkPreviewSquad),
     logSampleMaxPerWindow: c.int(
@@ -1249,6 +1314,10 @@ export function loadConfig(): BotConfig {
     telegramApiRoot: c.loopbackApiRoot("TELEGRAM_API_ROOT"),
     mimirAppUrl: c.optionalHttpsUrl("MIMIR_APP_URL"),
     healthAuthToken: c.optionalSecret("HEALTH_AUTH_TOKEN"),
+    followFile: (() => {
+      const raw = c.get("FOLLOW_FILE");
+      return raw !== undefined ? path.resolve(process.cwd(), raw) : undefined;
+    })(),
   };
 
   // ── Build canonical routes and reject duplicates ───────────────────────────
@@ -1332,9 +1401,13 @@ export function loadConfig(): BotConfig {
   if (config.healthPort !== 0 && !isLoopback(config.healthHost) && config.healthAuthToken === null) {
     console.warn(
       `[config] HEALTH_HOST=${config.healthHost} is non-loopback but HEALTH_AUTH_TOKEN is not set. ` +
-        `Health and metrics will be accessible without authentication. ` +
+        `Health, metrics, and any enabled Atom feed will be accessible without authentication. ` +
         `Set HEALTH_AUTH_TOKEN to protect these endpoints.`,
     );
+  }
+
+  if (config.atomFeedEnabled && config.healthPort === 0) {
+    console.warn("[config] ATOM_FEED_ENABLED=true but HEALTH_PORT=0; the Atom feed will not be served.");
   }
 
   return config;
@@ -1515,8 +1588,10 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "POLL_INTERVAL_MS", secret: false, hasBuiltInDefault: true },
   { key: "START_LOOKBACK_LEDGERS", secret: false, hasBuiltInDefault: true },
   { key: "CURSOR_FILE", secret: false, hasBuiltInDefault: true },
+  { key: "ACKNOWLEDGE_CURSOR_REPLAY", secret: false, hasBuiltInDefault: true },
   { key: "INSTANCE_LOCK_FILE", secret: false, hasBuiltInDefault: true },
   { key: "STATUS_FILE", secret: false, hasBuiltInDefault: true },
+  { key: "FOLLOW_FILE", secret: false },
   { key: "MAX_NOTIFICATIONS_PER_CYCLE", secret: false, hasBuiltInDefault: true },
   { key: "INTER_SEND_DELAY_MS", secret: false, hasBuiltInDefault: true },
   { key: "METRICS_PORT", secret: false },
@@ -1531,7 +1606,9 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "DEAD_LETTER_FILE", secret: false, hasBuiltInDefault: true },
   { key: "DEAD_LETTER_MAX", secret: false, hasBuiltInDefault: true },
   { key: "DEAD_LETTER_MAX_ATTEMPTS", secret: false, hasBuiltInDefault: true },
-  { key: "DEAD_LETTER_MAX_AGE_MS", secret: false, hasBuiltInDefault: true },
+  { key: "DIGEST_SCHEDULE", secret: false },
+  { key: "DIGEST_CHECKPOINT_FILE", secret: false, hasBuiltInDefault: true },
+  { key: "DIGEST_MAX_PENDING", secret: false, hasBuiltInDefault: true },
   { key: "HEALTH_HOST", secret: false, hasBuiltInDefault: true },
   {
     key: "HEALTH_PORT",
@@ -1550,6 +1627,9 @@ export const CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "HEALTH_STALE_MS", secret: false, hasBuiltInDefault: true },
   { key: "HEALTH_SHUTDOWN_GRACE_MS", secret: false, hasBuiltInDefault: true },
   { key: "HEALTH_AUTH_TOKEN", secret: true },
+  { key: "ATOM_FEED_ENABLED", secret: false, hasBuiltInDefault: true },
+  { key: "ATOM_FEED_MAX_ENTRIES", secret: false, hasBuiltInDefault: true },
+  { key: "ATOM_FEED_SELF_URL", secret: false },
   { key: "STARTUP_HEALTH_DEADLINE_MS", secret: false, hasBuiltInDefault: true },
   { key: "STARTUP_HEALTH_RETRY_MS", secret: false, hasBuiltInDefault: true },
   { key: "SHUTDOWN_TIMEOUT_MS", secret: false, hasBuiltInDefault: true },

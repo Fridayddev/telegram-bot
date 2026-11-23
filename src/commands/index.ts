@@ -13,19 +13,27 @@
  *      `COMMAND_DETAILS` in `src/commands/help-detail.ts`
  *
  * `src/bot.ts` never needs editing: it registers whatever the registry holds.
+ * `commandMenus()` derives the default public menu and the operator-chat menu
+ * from these modules; declared authorization gates still run on every update.
  */
 
 // Registration order = menu order. Keep this list in sync with the menu.
 import "./help.js"; // registers /start and /help, in that order
 import "./about.js";
+import "./menu.js";
 import "./status.js";
+import "./events.js";
 import "./audit.js";
 import "./contracts.js";
+import "./filters.js";
 import "./health.js";
 import "./preview.js";
-import "./categories.js";
+import "./stats.js";
 import "./pause.js";
 import "./resume.js";
+import "./follow.js";
+import "./unfollow.js";
+import "./follows.js";
 import "./log-export.js"; // hidden: operator log export
 import "./match-preview.js"; // hidden: operator subscription match count
 import "./digest-preview.js"; // hidden: operator pending digest preview
@@ -64,6 +72,7 @@ export {
   type CommandAvailabilityReport,
   type CommandDeps,
   type CommandHandler,
+  type CommandMenu,
   type CommandMetadata,
   type CommandModule,
 } from "./registry.js";
@@ -94,17 +103,32 @@ export { aboutMessage, aboutCommand } from "./about.js";
 export { helpCommand, helpMessage, startCommand } from "./help.js";
 export { auditCommand, renderAuditForTelegram } from "./audit.js";
 export { contractsCommand, contractsMessage } from "./contracts.js";
+export { filtersCommand, filtersMessage } from "./filters.js";
 export { healthCommand, healthMessage } from "./health.js";
+export { menuCommand, menuKeyboard, menuMessage } from "./menu.js";
 export { pauseCommand, pauseMessage, PAUSE_PROMPT } from "./pause.js";
 export { previewCommand } from "./preview.js";
 export {
-  CategoryCounter,
-  categoriesCommand,
-  categoriesMessage,
-  createCategoryCounter,
-} from "./categories.js";
+  statsCommand,
+  statsMessage,
+  statsSnapshotFromDeps,
+  type StatsSnapshot,
+} from "./stats.js";
 export { resumeCommand, resumeMessage } from "./resume.js";
 export { lastEventMessage, statusCommand, statusMessage } from "./status.js";
+export {
+  EVENTS_PAGE_SIZE,
+  EVENTS_USAGE_MESSAGE,
+  MAX_EVENT_SUMMARY_CHARS,
+  RecentEventStore,
+  eventsCommand,
+  eventsMessage,
+  eventsPage,
+  parseEventsPageArg,
+  resolveRecentEvents,
+  toCanonicalEventSummary,
+  type CanonicalEventSummary,
+} from "./events.js";
 export { logExportCommand } from "./log-export.js";
 export {
   matchPreviewCommand,

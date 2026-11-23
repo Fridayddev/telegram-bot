@@ -9,10 +9,17 @@ export interface Ref {
   id: string;
 }
 
-/** Version 1 on-disk layout: no network identity. */
-interface StoreFileV1 {
-  version: 1;
+export interface FollowRecord {
+  lastActivityAt: number;
+  expiresAt: number;
+}
+
+export interface StoreFile {
+  version: number;
+  // chatId -> array of ref strings (e.g. "market:123")
   follows: Record<string, string[]>;
+  // chatId -> ref -> activity/expiry metadata
+  meta?: Record<string, Record<string, FollowRecord>>;
 }
 
 /** Version 2 on-disk layout: includes the Stellar network passphrase. */
@@ -36,6 +43,10 @@ export const DEFAULT_MAX_PER_CHAT = 50;
  */
 
 export const DEFAULT_MAX_TOTAL = 5000;
+
+export const DIGEST_INTERVAL_MIN_SECONDS = 60;
+
+export const DIGEST_INTERVAL_MAX_SECONDS = 7 * 24 * 60 * 60;
 
 /** Version of the portable chat export format. */
 export const EXPORT_VERSION = 1;
@@ -78,10 +89,9 @@ export interface FollowStoreFs {
  * `${filePath}.corrupt.<timestamp>`; if quarantine `rename` fails, source bytes
  * are retained in place (never unlinked) and a redacted `FollowStoreError` is thrown.
  *
- * When `network` is supplied, the store records it in every new file (version 2)
- * and refuses to open an existing file that was written for a different network.
- * An existing version-1 file (no network) must be migrated explicitly via
- * {@link FollowStore.migrateToNetwork} before the network check can be enforced.
+ * `inactivityTtlMs`, when set, expires a follow once it has gone `inactivityTtlMs`
+ * without activity. Activity is recorded on `follow()` and via `touch()`. Expired
+ * follows are pruned on read; active follows are never removed by pruning.
  */
 export interface FollowStoreOptions {
   filePath: string;
@@ -90,18 +100,7 @@ export interface FollowStoreOptions {
   // Aliases for API compatibility.
   maxFollowsPerChat?: number;
   maxTotalEntries?: number;
-  /**
-   * Stellar network passphrase (or any stable network identifier) that this
-   * store is bound to. When set:
-   * - new files are written at version 2 with this value
-   * - existing version-2 files must carry the same value or the store throws
-   * - existing version-1 files (no network field) trigger a `FollowStoreError`
-   *   until `migrateToNetwork()` is called
-   *
-   * When absent, the store operates without network enforcement (backwards
-   * compatible with callers that do not have a passphrase available).
-   */
-  network?: string | undefined;
+  inactivityTtlMs?: number;
   fs?: Partial<FollowStoreFs>;
   now?: () => number;
 }
@@ -157,29 +156,47 @@ export function formatRef(kind: RefKind, id: string): string {
   return `${kind}:${id}`;
 }
 
-function emptyStore(network?: string): StoreFile {
-  if (network !== undefined) {
-    return { version: 2, network, follows: {} };
-  }
-  return { version: 1, follows: {} };
+function emptyStore(): StoreFile {
+  return { version: STORE_VERSION, follows: {}, meta: {} };
 }
 
-function normalizeRefList(chatId: string, list: unknown, context: string): string[] {
-  if (!Array.isArray(list)) {
-    throw new FollowStoreError(`${context}[${chatId}] is not an array`);
+function validateMeta(
+  raw: unknown,
+  follows: Record<string, string[]>,
+): Record<string, Record<string, FollowRecord>> {
+  const meta: Record<string, Record<string, FollowRecord>> = {};
+  if (raw === undefined) return meta;
+  if (!isPlainObject(raw)) {
+    throw new FollowStoreError("meta is not an object");
   }
-  const seen = new Set<string>();
-  const cleaned: string[] = [];
-  for (const entry of list) {
-    if (typeof entry !== "string" || parseRef(entry) === null) {
-      throw new FollowStoreError(`invalid ref in ${context}[${chatId}]`);
+  for (const [chatId, byRef] of Object.entries(raw)) {
+    if (!isPlainObject(byRef)) {
+      throw new FollowStoreError(`meta[${chatId}] is not an object`);
     }
-    if (!seen.has(entry)) {
-      seen.add(entry);
-      cleaned.push(entry);
+    const out: Record<string, FollowRecord> = {};
+    for (const [ref, rec] of Object.entries(byRef)) {
+      if (
+        !isPlainObject(rec) ||
+        typeof rec.lastActivityAt !== "number" ||
+        typeof rec.expiresAt !== "number" ||
+        !Number.isFinite(rec.lastActivityAt) ||
+        !Number.isFinite(rec.expiresAt)
+      ) {
+        throw new FollowStoreError(`invalid meta record for ${chatId}/${ref}`);
+      }
+      out[ref] = { lastActivityAt: rec.lastActivityAt, expiresAt: rec.expiresAt };
     }
+    if (Object.keys(out).length > 0) meta[chatId] = out;
   }
-  return cleaned;
+  // Drop metadata for refs that are no longer followed.
+  for (const chatId of Object.keys(meta)) {
+    const list = follows[chatId] ?? [];
+    for (const ref of Object.keys(meta[chatId])) {
+      if (!list.includes(ref)) delete meta[chatId][ref];
+    }
+    if (Object.keys(meta[chatId]).length === 0) delete meta[chatId];
+  }
+  return meta;
 }
 
 function validateStoreFile(data: unknown): StoreFile {
@@ -196,7 +213,8 @@ function validateStoreFile(data: unknown): StoreFile {
   for (const [chatId, list] of Object.entries(data.follows as Record<string, unknown>)) {
     follows[chatId] = normalizeRefList(chatId, list, "follows");
   }
-  throw new FollowStoreError(`unsupported store version: ${String(version)}`);
+  const meta = validateMeta(data.meta, follows);
+  return { version: STORE_VERSION, follows, meta };
 }
 
 function quarantineFile(
@@ -223,7 +241,7 @@ export class FollowStore {
   private readonly filePath: string;
   private readonly maxPerChat: number;
   private readonly maxTotal: number;
-  private readonly network: string | undefined;
+  private readonly inactivityTtlMs: number | undefined;
   private readonly readFileSync: FollowStoreFs["readFileSync"];
   private readonly renameSync: FollowStoreFs["renameSync"];
   private readonly now: () => number;
@@ -241,7 +259,13 @@ export class FollowStore {
     this.maxPerChat =
       options.maxPerChat ?? options.maxFollowsPerChat ?? DEFAULT_MAX_PER_CHAT;
     this.maxTotal = options.maxTotal ?? options.maxTotalEntries ?? DEFAULT_MAX_TOTAL;
-    this.network = options.network;
+    if (
+      options.inactivityTtlMs !== undefined &&
+      (!Number.isFinite(options.inactivityTtlMs) || options.inactivityTtlMs <= 0)
+    ) {
+      throw new FollowStoreError("inactivityTtlMs must be a positive finite number");
+    }
+    this.inactivityTtlMs = options.inactivityTtlMs;
     this.readFileSync =
       options.fs?.readFileSync ?? ((p, enc) => fs.readFileSync(p, enc));
     this.renameSync = options.fs?.renameSync ?? fs.renameSync;
@@ -326,26 +350,64 @@ export class FollowStore {
     fs.renameSync(tmp, this.filePath);
   }
 
+  /**
+   * Removes follows whose expiry has passed. Active follows are kept. Returns
+   * the number of pruned entries. No-op when no inactivity TTL is configured.
+   */
+  private pruneExpired(data: StoreFile): number {
+    if (this.inactivityTtlMs === undefined) return 0;
+    const cutoff = this.now();
+    const meta = data.meta ?? {};
+    let pruned = 0;
+    for (const chatId of Object.keys(data.follows)) {
+      const list = data.follows[chatId];
+      const kept: string[] = [];
+      for (const ref of list) {
+        const rec = meta[chatId]?.[ref];
+        if (rec && rec.expiresAt <= cutoff) {
+          pruned += 1;
+          if (meta[chatId]) delete meta[chatId][ref];
+          continue;
+        }
+        kept.push(ref);
+      }
+      if (kept.length === 0) {
+        delete data.follows[chatId];
+        delete meta[chatId];
+      } else {
+        data.follows[chatId] = kept;
+        if (meta[chatId] && Object.keys(meta[chatId]).length === 0) delete meta[chatId];
+      }
+    }
+    data.meta = meta;
+    return pruned;
+  }
+
+  private touchRecord(data: StoreFile, chatId: string, ref: string): void {
+    if (this.inactivityTtlMs === undefined) return;
+    const at = this.now();
+    data.meta ??= {};
+    data.meta[chatId] ??= {};
+    data.meta[chatId][ref] = {
+      lastActivityAt: at,
+      expiresAt: at + this.inactivityTtlMs,
+    };
+  }
+
   private totalCount(data: StoreFile): number {
     let total = 0;
     for (const list of Object.values(data.follows)) total += list.length;
     return total;
   }
 
-  /**
-   * Add `ref` to `chatId`'s follow list.
-   *
-   * Argument validation is synchronous and throws `FollowStoreError` before
-   * the returned Promise is created. The read-modify-write is serialized
-   * through an in-process mutex so concurrent calls never overwrite each other.
-   *
-   * @returns A Promise that resolves to `true` when the ref was added, or
-   *   `false` when it was already present (idempotent).
-   */
-  follow(chatId: string, ref: string): Promise<boolean> {
+  private assertChatId(chatId: string): void {
     if (typeof chatId !== "string" || chatId.length === 0) {
       throw new FollowStoreError("chatId must be a non-empty string");
     }
+  }
+
+  follow(chatId: string, ref: string): boolean {
+    this.assertChatId(chatId);
     if (parseRef(ref) === null) {
       throw new FollowStoreError(`invalid ref: ${ref}`);
     }
@@ -440,63 +502,92 @@ export class FollowStore {
     }
 
     const data = this.read();
-    let totalNew = 0;
-    let skipped = 0;
-    const pending: Array<{ chatId: string; toAdd: string[] }> = [];
-
-    for (const [chatId, { rawCount, refs }] of normalized) {
-      const existing = data.follows[chatId] ?? [];
-      const existingSet = new Set(existing);
-      const toAdd = refs.filter((ref) => !existingSet.has(ref));
-      skipped += rawCount - toAdd.length;
-
-      if (existing.length + toAdd.length > this.maxPerChat) {
-        throw new FollowStoreError(`per-chat follow limit reached (${this.maxPerChat})`);
+    this.pruneExpired(data);
+    const existing = data.follows[chatId] ?? [];
+    if (existing.includes(ref)) {
+      // Re-following an active entry counts as activity and refreshes expiry.
+      if (this.inactivityTtlMs !== undefined) {
+        this.touchRecord(data, chatId, ref);
+        this.write(data);
       }
-      totalNew += toAdd.length;
-      if (toAdd.length > 0) {
-        pending.push({ chatId, toAdd });
-      }
+      return false;
     }
 
     if (this.totalCount(data) + totalNew > this.maxTotal) {
       throw new FollowStoreError(`total follow limit reached (${this.maxTotal})`);
     }
+    data.follows[chatId] = [...existing, ref];
+    this.touchRecord(data, chatId, ref);
+    this.write(data);
+    return true;
+  }
 
-    if (totalNew > 0) {
-      for (const { chatId, toAdd } of pending) {
-        data.follows[chatId] = [...(data.follows[chatId] ?? []), ...toAdd];
-      }
-      this.write(data);
+  /**
+   * Records activity for an existing follow, extending its expiry. Returns
+   * false if the follow does not exist (or has already expired).
+   */
+  touch(chatId: string, ref: string): boolean {
+    this.assertChatId(chatId);
+    if (parseRef(ref) === null) {
+      throw new FollowStoreError(`invalid ref: ${ref}`);
     }
+    const data = this.read();
+    this.pruneExpired(data);
+    if (!(data.follows[chatId] ?? []).includes(ref)) {
+      this.write(data);
+      return false;
+    }
+    this.touchRecord(data, chatId, ref);
+    this.write(data);
+    return true;
+  }
 
-    return { added: totalNew, skipped };
+  /** Prunes expired follows and persists the result. Returns pruned count. */
+  pruneExpiredFollows(): number {
+    const data = this.read();
+    const pruned = this.pruneExpired(data);
+    if (pruned > 0) this.write(data);
+    return pruned;
+  }
+
+  unfollow(chatId: string, ref: string): boolean {
+    this.assertChatId(chatId);
+    if (parseRef(ref) === null) {
+      throw new FollowStoreError(`invalid ref: ${ref}`);
+    }
+    const data = this.read();
+    const existing = data.follows[chatId];
+    if (!existing || !existing.includes(ref)) {
+      return false;
+    }
+    const next = existing.filter((entry) => entry !== ref);
+    if (next.length === 0) {
+      delete data.follows[chatId];
+      if (data.meta) delete data.meta[chatId];
+    } else {
+      data.follows[chatId] = next;
+      if (data.meta?.[chatId]) delete data.meta[chatId][ref];
+    }
+    this.write(data);
+    return true;
+  }
+
+  list(chatId: string): string[] {
+    this.assertChatId(chatId);
+    const data = this.read();
+    if (this.pruneExpired(data) > 0) this.write(data);
+    return [...(data.follows[chatId] ?? [])];
   }
 
   followersOf(ref: string): string[] {
     if (parseRef(ref) === null) {
       throw new FollowStoreError(`invalid ref: ${ref}`);
     }
-    return Promise.resolve(this.read()).then((data) => {
-      const result: string[] = [];
-      for (const [chatId, list] of Object.entries(data.follows)) {
-        if (list.includes(ref)) result.push(chatId);
-      }
-      return result;
-    });
-  }
-
-  /**
-   * Export a versioned snapshot of one chat's follows.
-   *
-   * The returned object is JSON-serialisable and self-describing: it carries
-   * the export version, the chat id, and the ordered ref list. No other chat's
-   * data is included. Returns an export with an empty `refs` array when the
-   * chat has no follows (not an error).
-   */
-  exportChat(chatId: string): ChatExport {
-    if (typeof chatId !== "string" || chatId.length === 0) {
-      throw new FollowStoreError("chatId must be a non-empty string");
+    const data = this.read();
+    if (this.pruneExpired(data) > 0) this.write(data);
+    const result: string[] = [];
+    for (const [chatId, list] of Object.entries(data.follows)) {
+      if (list.includes(ref)) result.push(chatId);
     }
     const data = this.read();
     return {

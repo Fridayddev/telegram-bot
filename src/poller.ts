@@ -87,7 +87,7 @@ import {
   type OrphanedJournalEntry,
   type SendJournal,
 } from "./notifications/send-journal.js";
-import { resolveRouteChatId } from "./notifications/notifier.js";
+import { InvalidDeliveryResultError } from "./notifications/notifier.js";
 import {
   acquireInstanceLock,
   InstanceLockError,
@@ -96,10 +96,12 @@ import {
 import {
   clip,
   explorerKeyboard,
+  formatDigestPages,
   formatEvent,
   formatPlainTextEvent,
   safeErrorMessage,
 } from "./notifications/format.js";
+import { notificationCorrelationId } from "./notifications/correlation.js";
 import { formatSuppressedRepeats, LogSampler } from "./log-sampler.js";
 import { Logger } from "./logger.js";
 import { isNotificationAllowed } from "./notifications/featureFlags.js";
@@ -113,6 +115,10 @@ import {
   type CircuitBreakerState,
 } from "./stellar/rpc-guard.js";
 import { LedgerCache } from "./stellar/ledger-cache.js";
+import {
+  RpcLatencyHistogram,
+  type RpcLatencySnapshot,
+} from "./stellar/metrics.js";
 import {
   eventCursorLedger,
   readContractEvents,
@@ -130,6 +136,7 @@ import {
   type DecodedEvent,
   type DecoderCapabilityReport,
 } from "./stellar/decode.js";
+import { RecentEventStore, type CanonicalEventSummary } from "./commands/events.js";
 
 export interface TargetState {
   source: ContractSource;
@@ -362,13 +369,18 @@ export interface PollerStatus {
   /** In-memory cursor state is newer than the persisted file. */
   pendingFlush: boolean;
   lastFlushAt: number | null;
-  /**
-   * Repetitive error lines withheld by the sampler since start. They are
+  /** Repetitive error lines withheld by the sampler since start. They are
    * summarized in the log rather than dropped; surfaced here for `/status`.
    */
   suppressedLogs: number;
+  /** Active recovery generation of cursor persistence. */
+  recoveryGeneration?: number;
+  /** Flags for unsupported contract version combinations detected before start. */
+  unsupportedVersions?: Array<{ source: string; version: string; fallback: string; reason: string }>;
   /** Dead-letter queue counters (see src/deadLetter.ts). */
   deadLetter: DeadLetterStats;
+  /** Fixed-provider, fixed-bucket RPC latency snapshot for `/metrics`. */
+  rpcLatency?: RpcLatencySnapshot;
   /** Telegram sends abandoned by the per-send timeout, when tracked. */
   sendTimeouts?: number;
   /** Bounded description of the most recent send timeout, when tracked. */
@@ -437,8 +449,14 @@ export interface CursorFile {
    * it, so the on-disk format stays version 1 either way.
    */
   chainClockAt?: number | null;
-  /** Optional network identifier for backup ownership validation. */
-  network?: string;
+  /**
+   * Monotonically non-decreasing generation counter representing the recovery
+   * epoch of this cursor. Older backups carry a strictly lower generation than
+   * the active state, allowing startup rollback detection.
+   */
+  recoveryGeneration?: number;
+  /** True when an operator explicitly acknowledged intended replay for this state. */
+  replayAcknowledged?: boolean;
   targets: Record<string, CursorTarget>;
   /**
    * Bounded history of cursor recovery actions (floor rewinds, operator
@@ -741,6 +759,8 @@ export interface PollerDeps {
    * set. May reject.
    */
   send: (text: string, source?: ContractSource, extra?: SendExtra) => Promise<void>;
+  /** Receives each decoded event read from the chain, before delivery is attempted. */
+  onDecodedEvent?: ((event: DecodedEvent) => void) | undefined;
   /**
    * Optional direct notification hook for the operator (e.g. restart gaps).
    * Plain-text message sent to the operator's private chat.
@@ -787,6 +807,8 @@ export interface PollerDeps {
    * avoid waiting for real wall-clock time.
    */
   sleep?: (ms: number) => Promise<void>;
+  /** Optional clock for the scheduled digest timer (tests inject a fake clock). */
+  schedulerClock?: SchedulerClock;
 }
 
 export interface ShutdownOptions {
@@ -1336,6 +1358,10 @@ export function parseCursorFile(raw: string): CursorFile {
     // Additive field: only present when the file carried it.
     ...(parsed.chainClockAt !== undefined ? { chainClockAt: parseChainClock(parsed.chainClockAt) } : {}),
     targets,
+    ...(typeof parsed.recoveryGeneration === "number" && Number.isSafeInteger(parsed.recoveryGeneration) && parsed.recoveryGeneration >= 0
+      ? { recoveryGeneration: parsed.recoveryGeneration }
+      : {}),
+    ...(parsed.replayAcknowledged === true ? { replayAcknowledged: true } : {}),
     ...(recoveryHistory.length > 0 ? { recoveryHistory } : {}),
   };
 }
@@ -1490,6 +1516,12 @@ export function parseAndMigrateCursorFile(
         ? parsed.updatedAt
         : nowIso;
     const file: CursorFile = { version: CURSOR_SCHEMA_VERSION, updatedAt, targets };
+    if (typeof parsed.recoveryGeneration === "number" && Number.isSafeInteger(parsed.recoveryGeneration) && parsed.recoveryGeneration >= 0) {
+      file.recoveryGeneration = parsed.recoveryGeneration;
+    }
+    if (parsed.replayAcknowledged === true) {
+      file.replayAcknowledged = true;
+    }
     if (parsed.chainClockAt !== undefined) file.chainClockAt = parseChainClock(parsed.chainClockAt);
     if (parsed.recoveryHistory !== undefined) {
       const recoveryHistory = parseRecoveryHistory(parsed.recoveryHistory);
@@ -1593,12 +1625,18 @@ export function buildCursorFile(
   updatedAt: string,
   chainClockAt?: number | null,
   recoveryHistory?: readonly CursorRecoveryRecord[],
+  recoveryGeneration?: number,
+  replayAcknowledged?: boolean,
 ): CursorFile {
   const boundedHistory =
     recoveryHistory !== undefined ? parseRecoveryHistory(recoveryHistory) : [];
   return {
     version: CURSOR_SCHEMA_VERSION,
     updatedAt,
+    ...(typeof recoveryGeneration === "number" && Number.isSafeInteger(recoveryGeneration) && recoveryGeneration >= 0
+      ? { recoveryGeneration }
+      : {}),
+    ...(replayAcknowledged === true ? { replayAcknowledged: true } : {}),
     ...(chainClockAt !== undefined ? { chainClockAt } : {}),
     targets: Object.fromEntries(
       [...targets].map((t) => [
@@ -1618,6 +1656,176 @@ export function buildCursorFile(
     ),
     ...(boundedHistory.length > 0 ? { recoveryHistory: boundedHistory } : {}),
   };
+}
+
+/**
+ * Snapshot of cursor backup metadata used to detect startup rollbacks to an
+ * older cursor backup. Monotonically non-decreasing recovery generation
+ * ensures regressed state is identified across backup-and-restore actions.
+ */
+export interface CursorBackupMetadata {
+  version: number;
+  recoveryGeneration: number;
+  updatedAt: string;
+  chainClockAt?: number | null;
+  targets: Record<string, { cursor?: string | null; lastEventLedger?: number | null }>;
+}
+
+export function cursorBackupMetadataPath(cursorFile: string): string {
+  return `${cursorFile}.backup-meta.json`;
+}
+
+export async function writeBackupMetadata(
+  cursorFile: string,
+  metadata: CursorBackupMetadata,
+): Promise<void> {
+  const metaPath = cursorBackupMetadataPath(cursorFile);
+  const tmp = `${metaPath}.tmp-${process.pid}-${randomUUID()}`;
+  await mkdir(path.dirname(metaPath), { recursive: true });
+  await writeFile(tmp, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+  await rename(tmp, metaPath);
+}
+
+export async function readBackupMetadata(cursorFile: string): Promise<CursorBackupMetadata | null> {
+  const metaPath = cursorBackupMetadataPath(cursorFile);
+  try {
+    const raw = await readFile(metaPath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      const recoveryGeneration =
+        typeof parsed.recoveryGeneration === "number" &&
+        Number.isSafeInteger(parsed.recoveryGeneration) &&
+        parsed.recoveryGeneration >= 0
+          ? parsed.recoveryGeneration
+          : 0;
+      return {
+        version: typeof parsed.version === "number" ? parsed.version : 1,
+        recoveryGeneration,
+        updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : "",
+        chainClockAt: typeof parsed.chainClockAt === "number" ? parsed.chainClockAt : null,
+        targets: parsed.targets && typeof parsed.targets === "object" ? parsed.targets : {},
+      };
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      Logger.warn("poller", `[poller] unreadable backup metadata at ${metaPath}: ${safeErrorMessage(err)}`);
+    }
+  }
+
+  const bakPath = `${cursorFile}.bak`;
+  try {
+    const rawBak = await readFile(bakPath, "utf8");
+    const parsedBak = parseAndMigrateCursorFile(rawBak);
+    return {
+      version: parsedBak.file.version,
+      recoveryGeneration: parsedBak.file.recoveryGeneration ?? 0,
+      updatedAt: parsedBak.file.updatedAt,
+      chainClockAt: parsedBak.file.chainClockAt,
+      targets: Object.fromEntries(
+        Object.entries(parsedBak.file.targets).map(([k, v]) => [
+          k,
+          { cursor: v.cursor, lastEventLedger: v.lastEventLedger },
+        ]),
+      ),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export interface RollbackDetectionResult {
+  rollback: boolean;
+  reason?: string;
+  cursorGeneration?: number;
+  backupGeneration?: number;
+  regressedTargets?: Array<{
+    source: string;
+    cursorLedger: number | null;
+    backupLedger: number | null;
+  }>;
+}
+
+export function detectCursorRollback(
+  cursor: CursorFile,
+  backupMeta: CursorBackupMetadata | null,
+): RollbackDetectionResult {
+  if (!backupMeta) {
+    return { rollback: false };
+  }
+
+  const cursorGen = typeof cursor.recoveryGeneration === "number" ? cursor.recoveryGeneration : 0;
+  const backupGen = typeof backupMeta.recoveryGeneration === "number" ? backupMeta.recoveryGeneration : 0;
+
+  // 1. Monotonic recovery generation check:
+  if (cursorGen < backupGen) {
+    return {
+      rollback: true,
+      reason: `cursor recovery generation (${cursorGen}) is older than backup metadata (${backupGen})`,
+      cursorGeneration: cursorGen,
+      backupGeneration: backupGen,
+    };
+  }
+
+  // 2. Target position regression check within the same recovery generation:
+  if (cursorGen === backupGen && backupMeta.targets) {
+    const regressedTargets: Array<{
+      source: string;
+      cursorLedger: number | null;
+      backupLedger: number | null;
+    }> = [];
+
+    for (const [source, backupTarget] of Object.entries(backupMeta.targets)) {
+      const liveTarget = cursor.targets[source];
+      if (!liveTarget) continue;
+
+      const backupLedger =
+        backupTarget.lastEventLedger ??
+        (backupTarget.cursor ? eventCursorLedger(backupTarget.cursor) : null);
+      const liveLedger =
+        liveTarget.lastEventLedger ??
+        (liveTarget.cursor ? eventCursorLedger(liveTarget.cursor) : null);
+
+      if (typeof backupLedger === "number" && (liveLedger === null || liveLedger < backupLedger)) {
+        regressedTargets.push({
+          source,
+          cursorLedger: liveLedger,
+          backupLedger,
+        });
+      }
+    }
+
+    if (regressedTargets.length > 0) {
+      const detail = regressedTargets
+        .map((t) => `${t.source}: ledger ${t.cursorLedger ?? "none"} < backup ${t.backupLedger}`)
+        .join(", ");
+      return {
+        rollback: true,
+        reason: `cursor target positions regressed behind backup metadata (${detail})`,
+        cursorGeneration: cursorGen,
+        backupGeneration: backupGen,
+        regressedTargets,
+      };
+    }
+  }
+
+  return { rollback: false, cursorGeneration: cursorGen, backupGeneration: backupGen };
+}
+
+export class CursorRollbackError extends Error {
+  readonly cursorGeneration: number | null;
+  readonly backupGeneration: number | null;
+  readonly details: string;
+
+  constructor(
+    message: string,
+    options?: { cursorGeneration?: number | null; backupGeneration?: number | null; details?: string },
+  ) {
+    super(message);
+    this.name = "CursorRollbackError";
+    this.cursorGeneration = options?.cursorGeneration ?? null;
+    this.backupGeneration = options?.backupGeneration ?? null;
+    this.details = options?.details ?? "";
+  }
 }
 
 function isNonNegativeSafeInteger(value: unknown): value is number {
@@ -1934,6 +2142,9 @@ export function createPoller(deps: PollerDeps) {
   const notifiedGaps = new Set<string>();
   const { config, server, send } = deps;
   const metrics = deps.metrics;
+  // One histogram per poller. When the standalone metrics server is enabled it
+  // owns the same recorder, so both /metrics endpoints report identical data.
+  const rpcLatency = metrics?.rpcLatency ?? new RpcLatencyHistogram();
   const audit: AuditLog = deps.audit ?? createAuditLog();
   const sendSpacing =
     deps.sendOptions?.sendSpacingMs ?? config.interSendDelayMs ?? DEFAULT_SEND_SPACING_MS;
@@ -2039,6 +2250,8 @@ export function createPoller(deps: PollerDeps) {
     ]),
   );
 
+  const recentEvents = new RecentEventStore();
+
   // Per-contract consecutive floor-rewind budget. Kept out of `TargetState` so
   // status output stays plain data. It resets only when a scan comes back
   // inside the retained window, so an RPC that keeps handing back a
@@ -2049,6 +2262,8 @@ export function createPoller(deps: PollerDeps) {
 
   /** Bounded history of cursor recovery actions persisted alongside cursors. */
   let recoveryHistory: CursorRecoveryRecord[] = [];
+  /** Monotonic recovery generation counter tracking the active recovery epoch. */
+  let currentRecoveryGeneration = 1;
 
   // Per-contract redelivery guard. Kept out of `TargetState` so status output
   // stays plain data; the window is internal bookkeeping.
@@ -2072,6 +2287,67 @@ export function createPoller(deps: PollerDeps) {
     networkPassphrase: config.networkPassphrase,
     now,
   });
+
+  // Scheduled digests are opt-in via DIGEST_SCHEDULE. When unset, the poller
+  // delivers each event immediately with zero digest file I/O.
+  const digestScheduleSpec =
+    typeof config.digestSchedule === "string" && config.digestSchedule.trim().length > 0
+      ? config.digestSchedule.trim()
+      : null;
+  const digestCheckpoint: DigestCheckpoint | null = digestScheduleSpec
+    ? createDigestCheckpoint({
+        filePath:
+          typeof config.digestCheckpointFile === "string" &&
+          config.digestCheckpointFile.length > 0
+            ? config.digestCheckpointFile
+            : null,
+        maxPending: config.digestMaxPending ?? DEFAULT_DIGEST_MAX_PENDING,
+        now,
+      })
+    : null;
+  const digestScheduler: Scheduler | null =
+    digestScheduleSpec && digestCheckpoint
+      ? createScheduler({
+          schedule: digestScheduleSpec,
+          clock: deps.schedulerClock,
+          lastRunStore: digestCheckpoint,
+          run: async () => {
+            const pending = digestCheckpoint.snapshotPending();
+            if (pending.length === 0) return;
+            const chunks = formatDigestPages(pending, { grouped: true });
+            if (chunks.length === 0) return;
+            try {
+              for (const chunk of chunks) {
+                await sendWithRetry(
+                  (message) => send(message, undefined),
+                  chunk,
+                  config.botToken,
+                  sendOptions,
+                  () => !status.stopping,
+                  sleep,
+                );
+                recordSentIncrement();
+                metrics?.notificationsSent.inc();
+              }
+            } catch (err) {
+              recordFailedIncrement();
+              metrics?.notificationsFailed.inc();
+              Logger.error(
+                "poller",
+                `[poller] scheduled digest send failed (${pending.length} pending event(s) kept): ` +
+                  errorMessage(err),
+                {
+                  action: "digest_send_failed",
+                  pendingCount: pending.length,
+                  error: errorMessage(err),
+                },
+              );
+              throw err;
+            }
+            await digestCheckpoint.acknowledgeSent(new Set(pending.map((e) => e.eventId)));
+          },
+        })
+      : null;
 
   /** Crash-safe send journal: intent before a send, done after. */
   const sendJournalEnabled =
@@ -2106,6 +2382,7 @@ export function createPoller(deps: PollerDeps) {
     running: false,
     paused: false,
     stopping: false,
+    recoveryGeneration: currentRecoveryGeneration,
     chainClockAt: null,
     startedAt: 0,
     cycles: 0,
@@ -2131,7 +2408,8 @@ export function createPoller(deps: PollerDeps) {
     lastCycleEmptyPages: 0,
     lastCyclePages: 0,
     notificationsDropped: 0,
-    deadLetter: { depth: 0, enqueued: 0, replayed: 0, dropped: 0, expired: 0 },
+    deadLetter: { depth: 0, enqueued: 0, replayed: 0, dropped: 0 },
+    rpcLatency: rpcLatency.snapshot(),
     eventsDeduplicated: 0,
     cursorRewinds: 0,
     restartGaps: 0,
@@ -2401,7 +2679,59 @@ export function createPoller(deps: PollerDeps) {
       const result = parseAndMigrateCursorFile(raw, { now: () => new Date(now()) });
       status.cursorLoadError = null;
       const parsed = result.file;
-      let fingerprintMigrated = false;
+      const loadedGeneration = parsed.recoveryGeneration ?? 0;
+      currentRecoveryGeneration = Math.max(1, loadedGeneration);
+      status.recoveryGeneration = currentRecoveryGeneration;
+
+      // Rollback detection against backup metadata:
+      const backupMeta = await readBackupMetadata(config.cursorFile);
+      const rollbackCheck = detectCursorRollback(parsed, backupMeta);
+
+      if (rollbackCheck.rollback) {
+        const replayAllowed = config.acknowledgeCursorReplay || parsed.replayAcknowledged === true;
+        if (!replayAllowed) {
+          const detail = rollbackCheck.reason ?? "cursor state is older than backup metadata";
+          const err = new CursorRollbackError(
+            `[poller] cursor rollback detected: ${detail}. ` +
+              `Startup aborted to prevent unintended event replay. ` +
+              `To proceed, set ACKNOWLEDGE_CURSOR_REPLAY=true or restore with --ack-replay.`,
+            {
+              cursorGeneration: rollbackCheck.cursorGeneration,
+              backupGeneration: rollbackCheck.backupGeneration,
+              details: detail,
+            },
+          );
+          audit.record(
+            auditEntry("cursor_rollback_rejected", {
+              detail: `${detail} (cursorGen=${rollbackCheck.cursorGeneration ?? 0}, backupGen=${rollbackCheck.backupGeneration ?? 0})`,
+            }),
+          );
+          throw err;
+        }
+
+        const backupGen = rollbackCheck.backupGeneration ?? 0;
+        currentRecoveryGeneration = Math.max(currentRecoveryGeneration, backupGen) + 1;
+        status.recoveryGeneration = currentRecoveryGeneration;
+        markDirty();
+        pendingRewrite = true;
+        Logger.warn(
+          "poller",
+          `[poller] cursor rollback acknowledged; proceeding with replay ` +
+            `(${rollbackCheck.reason}); advancing to recovery generation ${currentRecoveryGeneration}`,
+          {
+            action: "cursor_rollback_acknowledged",
+            cursorGeneration: rollbackCheck.cursorGeneration,
+            backupGeneration: rollbackCheck.backupGeneration,
+            nextGeneration: currentRecoveryGeneration,
+          },
+        );
+        audit.record(
+          auditEntry("cursor_rollback_acknowledged", {
+            detail: `${rollbackCheck.reason} (nextGen=${currentRecoveryGeneration})`,
+          }),
+        );
+      }
+
       for (const [source, saved] of Object.entries(parsed.targets)) {
         const key = source as ContractSource;
         const target = state.get(key);
@@ -2497,8 +2827,13 @@ export function createPoller(deps: PollerDeps) {
         },
       );
     } catch (err) {
+      if (err instanceof CursorRollbackError) {
+        throw err;
+      }
       // Quarantine then cold-start: never wedge on a corrupt state file, and
       // keep the bad bytes for operators instead of overwriting them on save.
+      currentRecoveryGeneration += 1;
+      status.recoveryGeneration = currentRecoveryGeneration;
       const reason = errorMessage(err);
       status.cursorLoadError = {
         kind: "corrupt",
@@ -2539,6 +2874,8 @@ export function createPoller(deps: PollerDeps) {
       new Date(now()).toISOString(),
       status.chainClockAt,
       recoveryHistory,
+      currentRecoveryGeneration,
+      false,
     );
 
     try {
@@ -2553,6 +2890,23 @@ export function createPoller(deps: PollerDeps) {
       // older than the primary — a crash here leaves the primary intact.
       const backupFile = `${config.cursorFile}.bak`;
       await copyFile(config.cursorFile, backupFile);
+      try {
+        const meta: CursorBackupMetadata = {
+          version: payload.version,
+          recoveryGeneration: currentRecoveryGeneration,
+          updatedAt: payload.updatedAt,
+          chainClockAt: payload.chainClockAt,
+          targets: Object.fromEntries(
+            Object.entries(payload.targets).map(([k, v]) => [
+              k,
+              { cursor: v.cursor, lastEventLedger: v.lastEventLedger },
+            ]),
+          ),
+        };
+        await writeBackupMetadata(config.cursorFile, meta);
+      } catch (metaErr) {
+        Logger.warn("poller", `[poller] could not persist backup metadata: ${errorMessage(metaErr)}`);
+      }
       status.pendingFlush = false;
       status.lastFlushAt = now();
       pendingRewrite = false;
@@ -2727,8 +3081,7 @@ export function createPoller(deps: PollerDeps) {
 
   async function notify(
     events: DecodedEvent[],
-    correlationId: string,
-    ingested: NotificationIngestionMark = notificationAge.markIngested(now()),
+    cycleCorrelationId: string,
   ): Promise<NotificationResult> {
     let sentThisCycle = 0;
     let failed = 0;
@@ -2737,6 +3090,7 @@ export function createPoller(deps: PollerDeps) {
     let capLogged = false;
 
     for (const event of events) {
+      const correlationId = notificationCorrelationId(event);
       metrics?.eventsDecoded.inc();
       categoryCounter.record(event);
 
@@ -2748,7 +3102,7 @@ export function createPoller(deps: PollerDeps) {
         const adminPart = adminAudit?.admin ? ` admin=${boundedLabel(adminAudit.admin, 56)}` : "";
         console.log(
           `[poller] logged admin event "${boundedLabel(event.payload.name, 80)}"${adminPart} ` +
-            `at ledger ${event.ledger}`,
+            `at ledger ${event.ledger} correlation=${correlationId}`,
         );
         continue;
       }
@@ -2784,7 +3138,7 @@ export function createPoller(deps: PollerDeps) {
         skipped += 1;
         console.log(
           `[poller] feature-flag skipped ${event.source} event "${boundedLabel(event.payload.name, 80)}" ` +
-            `at ledger ${event.ledger} (NOTIFY_* flags)`,
+            `at ledger ${event.ledger} (NOTIFY_* flags) correlation=${correlationId}`,
         );
         continue;
       }
@@ -2812,18 +3166,17 @@ export function createPoller(deps: PollerDeps) {
           // once, only when Telegram rejects the entities. Cursor accounting
           // below is unchanged: either path counts as sent, neither as skipped.
           const plainText = formatPlainTextEvent(config, event);
-          const eventRef = { eventId: event.eventId, ledger: event.ledger, source: event.source };
-          const eventCategory =
-            "category" in event.payload &&
-            typeof event.payload.category === "string" &&
-            event.payload.category.trim() !== ""
-              ? event.payload.category
-              : undefined;
+          const eventRef = {
+            eventId: event.eventId,
+            ledger: event.ledger,
+            source: event.source,
+            correlationId,
+          };
           extra = {
             eventName: event.payload.name,
-            ...(eventCategory ? { category: eventCategory } : {}),
+            eventRef,
             ...(reply_markup ? { reply_markup } : {}),
-            ...(plainText !== null ? { plainText, eventRef } : {}),
+            ...(plainText !== null ? { plainText } : {}),
           };
         }
       } catch (err) {
@@ -2833,9 +3186,11 @@ export function createPoller(deps: PollerDeps) {
         Logger.error(
           "poller",
           `[poller] format failed for ${event.source} event at ledger ${event.ledger}: ` +
-            errorMessage(err),
+            `${errorMessage(err)} correlation=${correlationId}`,
           {
             action: "format_failed",
+            correlationId,
+            cycleCorrelationId,
             eventId: event.eventId,
             source: event.source,
             ledger: event.ledger,
@@ -2856,6 +3211,13 @@ export function createPoller(deps: PollerDeps) {
             detail: `${event.payload.name} at ledger ${event.ledger}: notifiable text was null`,
           }),
         );
+        continue;
+      }
+
+      // Scheduled digest mode: buffer the event into the bounded checkpoint
+      // instead of sending immediately; the scheduler flushes grouped digests.
+      if (digestCheckpoint !== null) {
+        digestCheckpoint.enqueue(event);
         continue;
       }
 
@@ -2891,6 +3253,8 @@ export function createPoller(deps: PollerDeps) {
             droppedEvent: event.payload.name,
             source: event.source,
             ledger: event.ledger,
+            correlationId,
+            cycleCorrelationId,
           },
         );
         continue;
@@ -2956,6 +3320,20 @@ export function createPoller(deps: PollerDeps) {
         metrics?.recordNotificationAge(ageMs);
         status.notificationAge = notificationAge.summary();
         sentThisCycle += 1;
+        Logger.debug(
+          "poller",
+          `[poller] notification sent ${event.source} ${event.payload.name} ` +
+            `at ledger ${event.ledger} correlation=${correlationId}`,
+          {
+            action: "notification_sent",
+            correlationId,
+            cycleCorrelationId,
+            eventId: event.eventId,
+            eventName: event.payload.name,
+            source: event.source,
+            ledger: event.ledger,
+          },
+        );
         if (sendJournal) {
           try {
             await sendJournal.recordDone(event.eventId);
@@ -2969,19 +3347,15 @@ export function createPoller(deps: PollerDeps) {
         // All retries exhausted. The event still counts as failed and the cursor
         // still advances — but the message is parked instead of dropped, so a
         // transient Telegram outage costs a delay rather than the notification.
-        if (sendJournal) {
+        if (sendJournal && err instanceof InvalidDeliveryResultError) {
           try {
-            await sendJournal.recordError({
-              id: event.eventId,
-              source: event.source,
-              ledger: event.ledger,
-              eventName: event.payload.name,
-              error: err,
-              secrets: config.botToken ? [config.botToken] : [],
-            });
+            await sendJournal.recordInvalidResult(
+              event.eventId,
+              safeErrorMessage(err, [config.botToken]),
+            );
           } catch (journalErr) {
             console.error(
-              `[poller] send journal error record failed for ${event.eventId}: ${safeErrorMessage(journalErr)}`,
+              `[poller] send journal diagnostic failed for ${event.eventId}: ${safeErrorMessage(journalErr)}`,
             );
           }
         }
@@ -2997,12 +3371,22 @@ export function createPoller(deps: PollerDeps) {
           (event.source === "market" ? config.marketChatId : config.squadChatId) ||
           config.chatId ||
           config.chatIds?.[0];
-        const permanentReason = classifyPermanentSendError(err);
-        console.error(
+        Logger.error(
+          "poller",
           `[poller] send failed for ${event.payload.name} at ledger ${event.ledger}` +
             `${chat ? ` to chat ${chat}` : ""}` +
             `${permanentReason ? ` (reason=${permanentReason})` : " after retries"}: ` +
             `${errorMessage(err)} correlation=${correlationId}`,
+          {
+            action: "notification_send_failed",
+            correlationId,
+            cycleCorrelationId,
+            eventId: event.eventId,
+            eventName: event.payload.name,
+            source: event.source,
+            ledger: event.ledger,
+            error: errorMessage(err),
+          },
         );
         if (isForumTopicClosed(err)) {
           // Permanent route failure: the topic is closed or deleted. Retrying
@@ -3017,6 +3401,7 @@ export function createPoller(deps: PollerDeps) {
           );
         } else if (deadLetterEnabled) {
           await deadLetter.enqueue({
+            correlationId,
             source: event.source,
             ledger: event.ledger,
             eventName: event.payload.name,
@@ -3040,6 +3425,10 @@ export function createPoller(deps: PollerDeps) {
       );
     }
 
+    if (digestCheckpoint !== null) {
+      await digestCheckpoint.flush();
+    }
+
     return { sent: sentThisCycle, failed, skipped };
   }
 
@@ -3053,7 +3442,14 @@ export function createPoller(deps: PollerDeps) {
     try {
       const flushed = await deadLetter.flush(async (text, entry) => {
         await sendWithRetry(
-          (message) => send(message, entry.source as ContractSource),
+          (message) =>
+            send(message, entry.source as ContractSource, {
+              eventRef: {
+                source: entry.source,
+                ledger: entry.ledger,
+                correlationId: entry.correlationId,
+              },
+            }),
           text,
           config.botToken,
           sendOptions,
@@ -3145,6 +3541,8 @@ export function createPoller(deps: PollerDeps) {
     current.cursor = null;
     current.lastEventLedger = null;
     current.rewindFromLedger = window.oldestLedger;
+    currentRecoveryGeneration += 1;
+    status.recoveryGeneration = currentRecoveryGeneration;
     recoveryHistory = appendCursorRecoveryHistory(recoveryHistory, {
       at: new Date(at).toISOString(),
       reason: "floor_rewind",
@@ -3376,6 +3774,7 @@ export function createPoller(deps: PollerDeps) {
               dedupWindow: config.dedupWindow,
               maxPages: isHalfOpenProbe ? 1 : undefined,
               shouldDecode: (name) => isNotificationAllowed(config.featureFlags, target.source, name),
+              rpcLatency,
             }),
             SCAN_TIMEOUT_MS,
             "RPC scan",
@@ -3488,6 +3887,9 @@ export function createPoller(deps: PollerDeps) {
           // key (it carries no `topic`), and an id-less event would otherwise
           // never be recorded.
           for (const id of scan.seenEventIds) dedupWindow.add(id);
+          if (deps.onDecodedEvent !== undefined) {
+            for (const event of scan.events) deps.onDecodedEvent(event);
+          }
           if (scan.events.length > 0) {
             const ingested = notificationAge.markIngested(now());
             markDirty();
@@ -3533,6 +3935,7 @@ export function createPoller(deps: PollerDeps) {
 
           const newest = scan.events[scan.events.length - 1];
           if (newest !== undefined) current.lastEvent = newest;
+          if (scan.events.length > 0) recentEvents.record(scan.events);
 
           const decodedCount = scan.events.reduce(
             (acc, event) => (event.payload.name !== "unknown" ? acc + 1 : acc),
@@ -3707,6 +4110,7 @@ export function createPoller(deps: PollerDeps) {
       // they run even when the body above threw.
       try {
         status.targets = [...state.values()].map((t) => ({ ...t }));
+        status.rpcLatency = rpcLatency.snapshot();
         await saveCounters("cycle");
         await saveCursors("cycle");
         await persistStatus();
@@ -3824,6 +4228,11 @@ export function createPoller(deps: PollerDeps) {
       // Parked sends from the previous run are part of this run's work.
       await deadLetter.load();
       refreshDeadLetterStatus();
+
+      if (digestCheckpoint && digestScheduler) {
+        await digestCheckpoint.load();
+        await digestScheduler.start();
+      }
 
       // Recover which notifications may already have been sent: an intent
       // without a matching done means a crash happened between sendMessage and
@@ -3964,6 +4373,12 @@ export function createPoller(deps: PollerDeps) {
       resumePending = false;
       if (timer) clearTimeout(timer);
       timer = null;
+      if (digestScheduler) {
+        await digestScheduler.stop();
+      }
+      if (digestCheckpoint) {
+        await digestCheckpoint.flush();
+      }
       // Best-effort: the process may be exiting, but a final snapshot that says
       // `running: false` is what tells a supervisor the stop was deliberate.
       void persistStatus();
@@ -4029,6 +4444,13 @@ export function createPoller(deps: PollerDeps) {
         await saveCounters("shutdown");
       }
 
+      if (digestScheduler) {
+        await digestScheduler.stop();
+      }
+      if (digestCheckpoint) {
+        await digestCheckpoint.flush();
+      }
+
       status.running = false;
       await persistStatus();
       await releaseInstanceLock();
@@ -4052,6 +4474,11 @@ export function createPoller(deps: PollerDeps) {
         targets: [...state.values()].map((t) => ({ ...t })),
         categories: categoryCounter.countsRecord(),
       };
+    },
+
+    /** Bounded recent canonical event summaries retained in memory for `/events`. */
+    recentEvents(): readonly CanonicalEventSummary[] {
+      return recentEvents.list();
     },
 
     /**

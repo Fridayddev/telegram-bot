@@ -17,7 +17,16 @@ import {
   type CursorConsistencyReport,
 } from "./cursor-consistency.js";
 import { acquireInstanceLock } from "./instanceLock.js";
-import { DuplicateCursorTargetError, parseAndMigrateCursorFile } from "./poller.js";
+import { readArchive } from "./stellar/archive.js";
+import {
+  appendCursorRecoveryHistory,
+  parseAndMigrateCursorFile,
+  snapshotCursorPositions,
+  writeBackupMetadata,
+  type CursorBackupMetadata,
+  type CursorRecoveryPosition,
+  type CursorRecoveryRecord,
+} from "./poller.js";
 
 export interface BackupCursorOptions {
   cursorFile: string;
@@ -37,6 +46,7 @@ export interface BackupCursorResult {
 export interface RestoreCursorOptions extends BackupCursorOptions {
   lockFile: string;
   now?: () => Date;
+  ackReplay?: boolean;
 }
 
 export interface RecoveryPreviewOptions {
@@ -200,9 +210,25 @@ export async function backupCursor(options: BackupCursorOptions): Promise<void> 
     throw new Error(`backup already exists at ${options.backupFile}; pass --force to overwrite`);
   }
   await writeAtomic(options.backupFile, raw, options.force === true);
-  const digest = cursorDigest(raw);
-  const version = parsed.file.version;
-  const targets = Object.keys(parsed.file.targets).length;
+  const meta: CursorBackupMetadata = {
+    version: parsed.file.version,
+    recoveryGeneration: parsed.file.recoveryGeneration ?? 0,
+    updatedAt: parsed.file.updatedAt,
+    chainClockAt: parsed.file.chainClockAt,
+    targets: Object.fromEntries(
+      Object.entries(parsed.file.targets).map(([k, v]) => [
+        k,
+        { cursor: v.cursor, lastEventLedger: v.lastEventLedger },
+      ]),
+    ),
+  };
+  const metaFile = `${options.backupFile}.meta.json`;
+  await writeAtomic(metaFile, `${JSON.stringify(meta, null, 2)}\n`, options.force === true);
+  try {
+    await writeBackupMetadata(options.cursorFile, meta);
+  } catch {
+    // Non-fatal if cursor directory is read-only
+  }
   console.log(
     `[cursor] backed up schema=v${version} targets=${targets} digest=${digest.slice(0, 12)} ` +
       `from ${options.cursorFile} to ${options.backupFile}`,
@@ -304,12 +330,27 @@ export async function restoreCursor(options: RestoreCursorOptions): Promise<void
 
     let before: Record<string, CursorRecoveryPosition> = {};
     let priorHistory: CursorRecoveryRecord[] = parsed.file.recoveryHistory ?? [];
+    let liveGeneration = 0;
     if (liveExists) {
       try {
         const liveRaw = await readFile(options.cursorFile, "utf8");
         const liveParsed = parseAndMigrateCursorFile(liveRaw);
         before = snapshotCursorPositions(liveParsed.file.targets);
         priorHistory = liveParsed.file.recoveryHistory ?? [];
+        liveGeneration = liveParsed.file.recoveryGeneration ?? 0;
+        const liveMeta: CursorBackupMetadata = {
+          version: liveParsed.file.version,
+          recoveryGeneration: liveGeneration,
+          updatedAt: liveParsed.file.updatedAt,
+          chainClockAt: liveParsed.file.chainClockAt,
+          targets: Object.fromEntries(
+            Object.entries(liveParsed.file.targets).map(([k, v]) => [
+              k,
+              { cursor: v.cursor, lastEventLedger: v.lastEventLedger },
+            ]),
+          ),
+        };
+        await writeBackupMetadata(options.cursorFile, liveMeta);
       } catch {
         // Unreadable or corrupt live cursor: record empty before-positions
         // without copying raw bytes or secrets into recovery history.
@@ -318,6 +359,7 @@ export async function restoreCursor(options: RestoreCursorOptions): Promise<void
       }
     }
 
+    const backupGeneration = parsed.file.recoveryGeneration ?? 0;
     const after = snapshotCursorPositions(parsed.file.targets);
     const recoveryHistory = appendCursorRecoveryHistory(priorHistory, {
       at: (options.now ?? (() => new Date()))().toISOString(),
@@ -328,7 +370,18 @@ export async function restoreCursor(options: RestoreCursorOptions): Promise<void
     const nextFile = {
       ...parsed.file,
       recoveryHistory,
+      ...(options.ackReplay
+        ? {
+            replayAcknowledged: true,
+            recoveryGeneration: Math.max(liveGeneration, backupGeneration) + 1,
+          }
+        : {
+            recoveryGeneration: backupGeneration,
+          }),
     };
+    if (!options.ackReplay && "replayAcknowledged" in nextFile) {
+      delete (nextFile as { replayAcknowledged?: boolean }).replayAcknowledged;
+    }
 
     const normalized = `${JSON.stringify(nextFile, null, 2)}\n`;
     await writeAtomic(options.cursorFile, normalized, options.force === true);
@@ -337,7 +390,7 @@ export async function restoreCursor(options: RestoreCursorOptions): Promise<void
     const targets = Object.keys(parsed.file.targets).length;
     console.log(
       `[cursor] restored schema=v${nextFile.version} targets=${Object.keys(nextFile.targets).length} ` +
-        `from ${options.backupFile} to ${options.cursorFile}`,
+        `from ${options.backupFile} to ${options.cursorFile}${options.ackReplay ? " (replay acknowledged)" : ""}`,
     );
     return {
       status: "restored",
@@ -547,6 +600,7 @@ interface CliOptions {
   squadContract?: string;
   force: boolean;
   json: boolean;
+  ackReplay?: boolean;
 }
 
 function parseOptions(args: string[]): CliOptions {
@@ -559,10 +613,14 @@ function parseOptions(args: string[]): CliOptions {
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index] ?? "";
-    if (arg === "--force" || arg === "--json") {
+    if (arg === "--force" || arg === "--json" || arg === "--ack-replay" || arg === "--acknowledge-replay") {
       if (seen.has(arg)) throw new Error(`duplicate ${arg} option`);
       seen.add(arg);
-      options[arg.slice(2) as "force" | "json"] = true;
+      if (arg === "--ack-replay" || arg === "--acknowledge-replay") {
+        options.ackReplay = true;
+      } else {
+        options[arg.slice(2) as "force" | "json"] = true;
+      }
       continue;
     }
     if (!valued.has(arg)) {
@@ -615,7 +673,7 @@ async function main(): Promise<void> {
   if (action !== "backup" && action !== "restore" && action !== "history" && action !== "preview" && action !== "check") {
     throw new Error(
       "usage: npm run cursor -- <backup|restore|history|preview|check> [--file PATH] [--out PATH|--from PATH] " +
-        "[--to LEDGER] [--target NAME] [--retained-start LEDGER --retained-end LEDGER] [--force] " +
+        "[--to LEDGER] [--target NAME] [--retained-start LEDGER --retained-end LEDGER] [--ack-replay] [--force] " +
         "[--archive PATH [--json] [--market-contract ID] [--squad-contract ID]]",
     );
   }
@@ -695,7 +753,13 @@ async function main(): Promise<void> {
   if (!options.from) throw new Error("restore requires --from PATH");
   const backupFile = resolvePath(options.from);
   const lockFile = resolvePath(process.env.INSTANCE_LOCK_FILE ?? "./data/poller.lock");
-  await restoreCursor({ cursorFile, backupFile, lockFile, force: options.force });
+  await restoreCursor({
+    cursorFile,
+    backupFile,
+    lockFile,
+    force: options.force,
+    ackReplay: options.ackReplay,
+  });
 }
 
 const invokedPath = process.argv[1];

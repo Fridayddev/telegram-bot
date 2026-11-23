@@ -133,14 +133,20 @@ export const COMMAND_NAMES = [
   "start",
   "help",
   "about",
+  "menu",
   "status",
+  "events",
   "audit",
   "contracts",
+  "filters",
   "health",
   "preview",
-  "categories",
+  "stats",
   "pause",
   "resume",
+  "follow",
+  "unfollow",
+  "follows",
 ] as const;
 
 /** A registered command name. */
@@ -151,14 +157,20 @@ export const COMMAND_DESCRIPTIONS: Readonly<Record<CommandName, string>> = {
   start: "What this bot does",
   help: "Show help",
   about: "About this bot",
+  menu: "Show navigation menu",
   status: "Last-seen ledger and watched contracts",
+  events: "Recent observed contract events",
   audit: "Operator only: audit report (redacted, bounded)",
   contracts: "Contract ids and explorer links",
+  filters: "Active notification filters and routing",
   health: "Health assessment and operational readiness",
   preview: "Preview channel notification formatting",
-  categories: "Observed claim categories and counts",
+  stats: "Notification and RPC counters with process uptime",
   pause: "Operator only: pause new scans",
   resume: "Operator only: resume polling now",
+  follow: "Subscribe this chat to a market or squad ref",
+  unfollow: "Remove a follow subscription",
+  follows: "List active follow subscriptions for this chat",
 } as const;
 
 // ── Notification template interfaces ─────────────────────────────────────────
@@ -320,6 +332,72 @@ export interface NotificationPlainTemplates {
   minimal(source: string, ledger: string, eventId: string): string;
 }
 
+/**
+ * Telegram HTML notification headlines. Every dynamic value is supplied by the
+ * caller and must already be `escapeHtml`-escaped before being passed in.
+ * Templates restrict formatting to Telegram's allowed tags: `<b>`, `<i>`,
+ * `<code>`, and `<a>`.
+ */
+export interface NotificationHtmlTemplates {
+  // ── mimir-market ────────────────────────────────────────────────────────
+  claimCreated(claimId: string, category: string, creator: string): string;
+  claimChallenged(claimId: string, stake: string, challenger: string): string;
+  claimResolved(
+    claimId: string,
+    winnerSide: string,
+    confidence: string,
+    summary: string | null,
+  ): string;
+  claimCancelled(claimId: string): string;
+  marketSettled(
+    claimId: string,
+    totalPaid: string,
+    totalFees: string,
+    owedToChallengers: string,
+  ): string;
+  challengerPaid(
+    claimId: string,
+    challenger: string,
+    stake: string,
+    net: string,
+    gross: string,
+    fee: string,
+  ): string;
+  feeClaimed(amount: string, recipient: string): string;
+  withdrawal(amount: string, to: string): string;
+  withdrawalPending(amount: string, to: string): string;
+
+  // ── mimir-squad ─────────────────────────────────────────────────────────
+  marketCreated(
+    marketId: string,
+    question: string,
+    captain: string,
+    feeBps: string,
+    deadline: string,
+  ): string;
+  deposited(marketId: string, amount: string, side: string, participant: string): string;
+  withdrawn(marketId: string, participant: string, amount: string, side: string): string;
+  resolved(marketId: string, result: string, poolA: string, poolB: string): string;
+  claimed(
+    marketId: string,
+    participant: string,
+    net: string,
+    gross: string,
+    fee: string,
+  ): string;
+  feesClaimedSquad(amount: string, recipient: string): string;
+
+  // ── Fallback and preview ────────────────────────────────────────────────
+  fallbackEvent(
+    source: string,
+    contract: string,
+    ledger: string,
+    reason: string,
+    txPart: string,
+  ): string;
+  previewModePrefix: string;
+}
+
 /** Operator pause replies (MarkdownV2). */
 export interface PauseMessages {
   paused: string;
@@ -345,6 +423,7 @@ export interface Messages {
   commandDescriptions: Readonly<Record<CommandName, string>>;
   notificationMd: NotificationMarkdownTemplates;
   notificationPlain: NotificationPlainTemplates;
+  notificationHtml: NotificationHtmlTemplates;
   explorerButtonText: string;
   mimirAppButtonText: string;
 }
@@ -636,14 +715,20 @@ const ES_COMMAND_DESCRIPTIONS: Readonly<Record<CommandName, string>> = {
   start: "Qué hace este bot",
   help: "Mostrar ayuda",
   about: "Acerca de este bot",
+  menu: "Mostrar el menú de navegación",
   status: "Último ledger visto y contratos vigilados",
+  events: "Eventos recientes observados de contratos",
   audit: "Solo operadores: informe de auditoría (redactado, acotado)",
   contracts: "Ids de contratos y enlaces al explorador",
+  filters: "Filtros activos de notificaciones y enrutamiento",
   health: "Evaluación de salud y preparación operativa",
   preview: "Previsualizar el formato de las notificaciones del canal",
-  categories: "Categorías de reclamaciones observadas y conteos",
+  stats: "Contadores de notificaciones y RPC con tiempo activo",
   pause: "Solo operadores: pausar nuevos escaneos",
   resume: "Solo operadores: reanudar el sondeo ahora",
+  follow: "Suscribir este chat a un ref de mercado o escuadrón",
+  unfollow: "Eliminar una suscripción de seguimiento",
+  follows: "Listar las suscripciones activas de este chat",
 };
 
 const ES_NOTIFICATION_MD: NotificationMarkdownTemplates = {
@@ -885,6 +970,224 @@ const ES_NOTIFICATION_PLAIN: NotificationPlainTemplates = {
   },
 };
 
+// ── Notifications: event headlines (English HTML) ───────────────────────────
+
+export const NOTIFICATION_HTML: NotificationHtmlTemplates = {
+  // ── mimir-market ────────────────────────────────────────────────────────
+  claimCreated: (claimId: string, category: string, creator: string): string =>
+    `🆕 <b>New claim</b> #${claimId}\nCategory: ${category}\nCreator: ${creator}`,
+
+  claimChallenged: (claimId: string, stake: string, challenger: string): string =>
+    `⚔️ <b>Claim #${claimId} challenged</b>\nStake: <b>${stake}</b>\nChallenger: ${challenger}`,
+
+  claimResolved: (
+    claimId: string,
+    winnerSide: string,
+    confidence: string,
+    summary: string | null,
+  ): string => {
+    const summaryPart = summary ? `\n<i>${summary}</i>` : "";
+    return (
+      `⚖️ <b>Claim #${claimId} resolved</b> — winner: <b>${winnerSide}</b>\n` +
+      `Confidence: ${confidence}` +
+      summaryPart
+    );
+  },
+
+  claimCancelled: (claimId: string): string =>
+    `🚫 <b>Claim #${claimId} cancelled</b> — stakes returned`,
+
+  marketSettled: (
+    claimId: string,
+    totalPaid: string,
+    totalFees: string,
+    owedToChallengers: string,
+  ): string =>
+    `💰 <b>Claim #${claimId} settled</b>\n` +
+    `Paid out: <b>${totalPaid}</b> · fees ${totalFees}\n` +
+    `Owed to challengers: ${owedToChallengers}`,
+
+  challengerPaid: (
+    claimId: string,
+    challenger: string,
+    stake: string,
+    net: string,
+    gross: string,
+    fee: string,
+  ): string =>
+    `🏆 <b>Challenger paid</b> on claim #${claimId}\n` +
+    `${challenger} staked ${stake} → net <b>${net}</b>\n` +
+    `Gross ${gross} · fee ${fee}`,
+
+  feeClaimed: (amount: string, recipient: string): string =>
+    `🧾 <b>Fees claimed</b> — ${amount} to ${recipient}`,
+
+  withdrawal: (amount: string, to: string): string =>
+    `📤 <b>Withdrawal</b> — ${amount} to ${to}`,
+
+  withdrawalPending: (amount: string, to: string): string =>
+    `⏳ <b>Withdrawal parked</b> — ${amount} claimable by ${to}`,
+
+  // ── mimir-squad ─────────────────────────────────────────────────────────
+  marketCreated: (
+    marketId: string,
+    question: string,
+    captain: string,
+    feeBps: string,
+    deadline: string,
+  ): string =>
+    `🆕 <b>New squad market</b> #${marketId}\n` +
+    `${question}\n` +
+    `Captain: ${captain} · fee ${feeBps} bps · deadline ${deadline}`,
+
+  deposited: (marketId: string, amount: string, side: string, participant: string): string =>
+    `➕ <b>Squad #${marketId}</b> — ${amount} on <b>${side}</b>\n` +
+    `Participant: ${participant}`,
+
+  withdrawn: (marketId: string, participant: string, amount: string, side: string): string =>
+    `➖ <b>Squad #${marketId}</b> — ${participant} pulled ${amount} from ${side}`,
+
+  resolved: (marketId: string, result: string, poolA: string, poolB: string): string =>
+    `🏁 <b>Squad #${marketId} resolved</b> — <b>${result}</b>\n` +
+    `Pools: A ${poolA} · B ${poolB}`,
+
+  claimed: (
+    marketId: string,
+    participant: string,
+    net: string,
+    gross: string,
+    fee: string,
+  ): string =>
+    `💸 <b>Squad payout</b> on #${marketId}\n` +
+    `${participant} → net <b>${net}</b> (gross ${gross}, fee ${fee})`,
+
+  feesClaimedSquad: (amount: string, recipient: string): string =>
+    `🧾 <b>Squad fees claimed</b> — ${amount} to ${recipient}`,
+
+  // ── Fallback and preview ────────────────────────────────────────────────
+  fallbackEvent: (
+    source: string,
+    contract: string,
+    ledger: string,
+    reason: string,
+    txPart: string,
+  ): string =>
+    `⚠️ <b>Event Notification Fallback</b> (${source})\n` +
+    `Contract: <code>${contract}</code> · Ledger: ${ledger}${txPart}\n` +
+    `Reason: <i>${reason}</i>`,
+
+  previewModePrefix: "🧪 <b>[PREVIEW MODE]</b>",
+};
+
+// ── Notifications: event headlines (Spanish HTML) ───────────────────────────
+
+const ES_NOTIFICATION_HTML: NotificationHtmlTemplates = {
+  // ── mimir-market ────────────────────────────────────────────────────────
+  claimCreated: (claimId: string, category: string, creator: string): string =>
+    `🆕 <b>Nueva reclamación</b> #${claimId}\nCategoría: ${category}\nCreador: ${creator}`,
+
+  claimChallenged: (claimId: string, stake: string, challenger: string): string =>
+    `⚔️ <b>Reclamación #${claimId} impugnada</b>\nApuesta: <b>${stake}</b>\nImpugnador: ${challenger}`,
+
+  claimResolved: (
+    claimId: string,
+    winnerSide: string,
+    confidence: string,
+    summary: string | null,
+  ): string => {
+    const summaryPart = summary ? `\n<i>${summary}</i>` : "";
+    return (
+      `⚖️ <b>Reclamación #${claimId} resuelta</b> — ganador: <b>${winnerSide}</b>\n` +
+      `Confianza: ${confidence}` +
+      summaryPart
+    );
+  },
+
+  claimCancelled: (claimId: string): string =>
+    `🚫 <b>Reclamación #${claimId} cancelada</b> — apuestas devueltas`,
+
+  marketSettled: (
+    claimId: string,
+    totalPaid: string,
+    totalFees: string,
+    owedToChallengers: string,
+  ): string =>
+    `💰 <b>Reclamación #${claimId} liquidada</b>\n` +
+    `Pagado: <b>${totalPaid}</b> · comisiones ${totalFees}\n` +
+    `Adeudado a impugnadores: ${owedToChallengers}`,
+
+  challengerPaid: (
+    claimId: string,
+    challenger: string,
+    stake: string,
+    net: string,
+    gross: string,
+    fee: string,
+  ): string =>
+    `🏆 <b>Impugnador pagado</b> en la reclamación #${claimId}\n` +
+    `${challenger} apostó ${stake} → neto <b>${net}</b>\n` +
+    `Bruto ${gross} · comisión ${fee}`,
+
+  feeClaimed: (amount: string, recipient: string): string =>
+    `🧾 <b>Comisiones reclamadas</b> — ${amount} a ${recipient}`,
+
+  withdrawal: (amount: string, to: string): string =>
+    `📤 <b>Retiro</b> — ${amount} a ${to}`,
+
+  withdrawalPending: (amount: string, to: string): string =>
+    `⏳ <b>Retiro pendiente</b> — ${amount} reclamable por ${to}`,
+
+  // ── mimir-squad ─────────────────────────────────────────────────────────
+  marketCreated: (
+    marketId: string,
+    question: string,
+    captain: string,
+    feeBps: string,
+    deadline: string,
+  ): string =>
+    `🆕 <b>Nuevo mercado de escuadrón</b> #${marketId}\n` +
+    `${question}\n` +
+    `Capitán: ${captain} · comisión ${feeBps} bps · cierre ${deadline}`,
+
+  deposited: (marketId: string, amount: string, side: string, participant: string): string =>
+    `➕ <b>Escuadrón #${marketId}</b> — ${amount} en <b>${side}</b>\n` +
+    `Participante: ${participant}`,
+
+  withdrawn: (marketId: string, participant: string, amount: string, side: string): string =>
+    `➖ <b>Escuadrón #${marketId}</b> — ${participant} retiró ${amount} de ${side}`,
+
+  resolved: (marketId: string, result: string, poolA: string, poolB: string): string =>
+    `🏁 <b>Escuadrón #${marketId} resuelto</b> — <b>${result}</b>\n` +
+    `Pozos: A ${poolA} · B ${poolB}`,
+
+  claimed: (
+    marketId: string,
+    participant: string,
+    net: string,
+    gross: string,
+    fee: string,
+  ): string =>
+    `💸 <b>Pago de escuadrón</b> en #${marketId}\n` +
+    `${participant} → neto <b>${net}</b> (bruto ${gross}, comisión ${fee})`,
+
+  feesClaimedSquad: (amount: string, recipient: string): string =>
+    `🧾 <b>Comisiones de escuadrón reclamadas</b> — ${amount} a ${recipient}`,
+
+  // ── Fallback and preview ────────────────────────────────────────────────
+  fallbackEvent: (
+    source: string,
+    contract: string,
+    ledger: string,
+    reason: string,
+    txPart: string,
+  ): string =>
+    `⚠️ <b>Notificación de evento alternativa</b> (${source})\n` +
+    `Contrato: <code>${contract}</code> · Ledger: ${ledger}${txPart}\n` +
+    `Motivo: <i>${reason}</i>`,
+
+  previewModePrefix: "🧪 <b>[MODO VISTA PREVIA]</b>",
+};
+
 // ── Message catalog ──────────────────────────────────────────────────────────
 
 /** English catalog. The named exports above are this object's fields. */
@@ -898,6 +1201,7 @@ export const EN_MESSAGES: Messages = {
   commandDescriptions: COMMAND_DESCRIPTIONS,
   notificationMd: NOTIFICATION_MD,
   notificationPlain: NOTIFICATION_PLAIN,
+  notificationHtml: NOTIFICATION_HTML,
   explorerButtonText: EXPLORER_BUTTON_TEXT,
   mimirAppButtonText: MIMIR_APP_BUTTON_TEXT,
 };
@@ -915,6 +1219,7 @@ export const ES_MESSAGES: Messages = {
   commandDescriptions: ES_COMMAND_DESCRIPTIONS,
   notificationMd: ES_NOTIFICATION_MD,
   notificationPlain: ES_NOTIFICATION_PLAIN,
+  notificationHtml: ES_NOTIFICATION_HTML,
   explorerButtonText: "Ver en el explorador",
   mimirAppButtonText: "Abrir en Mimir",
 };

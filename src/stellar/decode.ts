@@ -40,7 +40,7 @@ import {
   scValCollectionDepth,
 } from "./generic-decode.js";
 
-export { peekEventName, DEPTH_LIMIT_REASON, MAX_DECODED_COLLECTION_DEPTH, scValCollectionDepth };
+export { peekEventName };
 
 /** Which of the two Mimir contracts an event came from. */
 export type ContractSource = "market" | "squad";
@@ -100,6 +100,8 @@ export const SQUAD_SIDE: Record<number, string> = {
 };
 
 export interface EventMeta {
+  /** Optional archive record schema version, present on archived/migrated records. */
+  schemaVersion?: number;
   source: ContractSource;
   contractId: string;
   version: string;
@@ -1246,6 +1248,25 @@ export function listSupportedEventSchemas(
   }
 
   return schemas;
+}
+
+/**
+ * Generate a generic decoder capability report.
+ */
+export function getGenericDecoderCapabilityReport(contractId?: string): DecoderCapabilityReport {
+  return {
+    source: "generic",
+    ...(contractId ? { contractId } : {}),
+    version: "generic",
+    normalizedVersion: "generic",
+    supported: true,
+    decoderKind: "generic",
+    supportedVersions: ["generic"],
+    eventSchemas: listSupportedEventSchemas("generic"),
+    events: ["*"],
+    adminEvents: [],
+    wildcardSupport: true,
+  };
 }
 
 /**

@@ -15,13 +15,15 @@
  */
 
 import type { CommandContext, Context } from "grammy";
-import type { UserFromGetMe } from "grammy/types";
+import type { BotCommand, UserFromGetMe } from "grammy/types";
 
 import type { AuditLog } from "../audit.js";
 import type { BotConfig } from "../config.js";
 import { COMMAND_DESCRIPTIONS, messagesFor } from "../i18n.js";
 import type { LogCapture } from "../logger.js";
+import type { Metrics } from "../metrics.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "../poller.js";
+import type { FollowStore } from "../subscriptions/store.js";
 import type { BroadcastStore } from "./broadcast.js";
 import type { FollowStore } from "../subscriptions/store.js";
 import type { PendingDigestWindow } from "../notifications/digest-preview.js";
@@ -38,6 +40,8 @@ export interface CommandDeps {
   audit?: AuditLog | undefined;
   /** Where the audit JSONL file lives, for the file-backed report. */
   auditFile?: string | undefined;
+  /** Live in-process metrics registry backing /stats; absent for minimal harnesses. */
+  metrics?: Metrics | undefined;
   /**
    * Pre-populated bot info. When provided (e.g. in tests) grammy skips the
    * getMe() call so `bot.handleUpdate()` works without a real Telegram token.
@@ -53,6 +57,7 @@ export interface CommandDeps {
    * Absent means that command reports zero matches.
    */
   follows?: FollowStore | undefined;
+  followStore?: FollowStore | undefined;
   /**
    * Optional read-only view of the current pending digest window backing
    * `/digestpreview`. Absent means `/digestpreview` reports that no pending
@@ -91,9 +96,11 @@ export interface CommandModule {
    */
   readonly command: string;
   /**
-   * Operator-only commands answer only the configured operator and are hidden
-   * from the menu when no operator is configured. Non-operators are ignored
-   * silently: an error reply would confirm the command exists.
+   * Operator-only commands answer only the configured operator. They are kept
+   * out of the default Telegram menu and advertised only in the operator's
+   * private chat; with no operator configured they are omitted entirely.
+   * Non-operators are ignored silently: an error reply would confirm the
+   * command exists, and a cached Telegram menu is never an authorization gate.
    */
   readonly operatorOnly?: boolean;
   /**
@@ -291,111 +298,44 @@ export function visibleCommandMetadata(
     }));
 }
 
-/**
- * Inspect the command catalogue, menu descriptions, and `/help` detail entries
- * for drift — in particular, any advertised command without a live registered
- * handler.
- */
-export function findCommandConsistencyIssues(
-  options?: CommandConsistencyOptions,
-): CommandConsistencyIssue[] {
-  const modules = options?.modules ?? registeredCommands();
-  const menuDescriptions =
-    options?.menuDescriptions ?? (COMMAND_DESCRIPTIONS as Readonly<Record<string, string>>);
-  const helpDetails = options?.helpDetails;
-
-  const issues: CommandConsistencyIssue[] = [];
-  const byName = new Map<string, CommandModule>();
-
-  for (const module of modules) {
-    byName.set(module.command, module);
-
-    if (typeof module.handler !== "function") {
-      issues.push({
-        command: module.command,
-        source: "catalogue",
-        message: "registered command has no callable handler",
-      });
-    }
-
-    if (module.hidden !== true) {
-      const description = menuDescriptions[module.command];
-      if (typeof description !== "string" || description.trim().length === 0) {
-        issues.push({
-          command: module.command,
-          source: "menu",
-          message: "advertised command is missing a menu description in COMMAND_DESCRIPTIONS",
-        });
-      }
-
-      if (helpDetails !== undefined) {
-        const detail = helpDetails[module.command];
-        if (detail === undefined) {
-          issues.push({
-            command: module.command,
-            source: "help",
-            message: "advertised command is missing a help entry in COMMAND_DETAILS",
-          });
-        } else if (
-          detail.operatorOnly !== undefined &&
-          Boolean(detail.operatorOnly) !== Boolean(module.operatorOnly)
-        ) {
-          issues.push({
-            command: module.command,
-            source: "help",
-            message: "help entry operatorOnly flag disagrees with registered module",
-          });
-        }
-      }
-    }
-  }
-
-  for (const command of Object.keys(menuDescriptions)) {
-    const module = byName.get(command);
-    if (module === undefined) {
-      issues.push({
-        command,
-        source: "menu",
-        message: "advertised in COMMAND_DESCRIPTIONS without a live registered handler",
-      });
-    } else if (module.hidden === true) {
-      issues.push({
-        command,
-        source: "menu",
-        message: "hidden command must not be advertised in COMMAND_DESCRIPTIONS",
-      });
-    }
-  }
-
-  if (helpDetails !== undefined) {
-    for (const command of Object.keys(helpDetails)) {
-      const module = byName.get(command);
-      if (module === undefined) {
-        issues.push({
-          command,
-          source: "help",
-          message: "advertised in COMMAND_DETAILS without a live registered handler",
-        });
-      } else if (module.hidden === true) {
-        issues.push({
-          command,
-          source: "help",
-          message: "hidden command must not be advertised in COMMAND_DETAILS",
-        });
-      }
-    }
-  }
-
-  return issues;
+/** One Telegram `setMyCommands` payload and the scope where it should apply. */
+export interface CommandMenu {
+  /** Commands to advertise, in registration (menu) order. */
+  readonly commands: readonly BotCommand[];
+  /** Absent means Telegram's default scope: every chat that has not got a narrower menu. */
+  readonly scope?: {
+    readonly type: "chat";
+    /** `OPERATOR_TELEGRAM_USER_ID`; a user's private chat id is their user id. */
+    readonly chat_id: string;
+  };
 }
 
 /**
- * Throw {@link CommandConsistencyError} naming every inconsistent command if
- * the catalogue, menu, and `/help` tables disagree.
+ * Build the menus `registerCommands` sends to Telegram.
+ *
+ * The default menu deliberately excludes operator-only commands: Telegram
+ * caches menus per chat and may keep showing them after configuration changes,
+ * so a menu entry is advertising, not authorization. When an operator is
+ * configured, the full menu is registered for that operator's private chat so
+ * they keep every command they can already run. Runtime gates in `src/bot.ts`
+ * continue to decide who may actually execute a command.
  */
-export function validateCommandConsistency(options?: CommandConsistencyOptions): void {
-  const issues = findCommandConsistencyIssues(options);
-  if (issues.length > 0) {
-    throw new CommandConsistencyError(issues);
+export function commandMenus(config?: BotConfig): readonly CommandMenu[] {
+  const visible = visibleCommandMetadata(config);
+  const telegramCommands = (items: readonly CommandMetadata[]): readonly BotCommand[] =>
+    items.map(({ command, description }) => ({ command, description }));
+
+  const menus: CommandMenu[] = [
+    { commands: telegramCommands(visible.filter(({ operatorOnly }) => !operatorOnly)) },
+  ];
+
+  const operatorChatId = config?.operatorTelegramUserId;
+  if (operatorChatId !== null && operatorChatId !== undefined && operatorChatId.length > 0) {
+    menus.push({
+      commands: telegramCommands(visible),
+      scope: { type: "chat", chat_id: operatorChatId },
+    });
   }
+
+  return menus;
 }

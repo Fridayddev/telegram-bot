@@ -79,7 +79,9 @@ which covers `/status` and the operator controls below.
 ### 3. Choose an operator (optional)
 
 Set `OPERATOR_TELEGRAM_USER_ID` to the numeric **user** id returned by
-`@userinfobot` to enable `/audit`, `/pause`, and `/resume`. The notification
+`@userinfobot` to enable `/audit`, `/pause`, and `/resume`. A user's private chat
+id is their user id, so the bot also uses this value to scope the privileged
+command menu to the operator's private chat. The notification
 `TELEGRAM_CHAT_ID` is intentionally not accepted as authorization: in a group,
 everyone can send messages from that chat. If this variable is omitted, existing
 deployments continue unchanged and the operator commands are ignored.
@@ -90,6 +92,7 @@ deployments continue unchanged and the operator commands are ignored.
 cp .env.example .env     # then fill in BOT_TOKEN and TELEGRAM_CHAT_ID
 npm install
 npm run doctor           # verify environment and .env configuration
+npm run support-bundle   # print a redacted JSON bundle for support requests
 npm run dev              # tsx, restarts on change
 ```
 
@@ -129,7 +132,9 @@ looks healthy but notifies nobody.
 | `/status` | Chain tip, the RPC's retained-history floor, the chain clock skew (newest chain close time the bot has seen, against its own clock), both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send/skip/dedup counters (plus messages dropped by a shutdown drain and cursors automatically rewound to the retained floor), and the last error |
 | `/audit` | Operator only. The operator audit report: recent scan failures, send failures, skipped and cap-dropped events, cursor problems — redacted and bounded (see [Operator audit trail](#operator-audit-trail)) |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
+| `/filters` | Active notification filters from the effective config: global feature flags, enabled/disabled event types, category allowlist, and redacted global versus route-specific chat routing settings |
 | `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
+| `/stats` | Reads the live in-process metrics registry and reports notification sent/failed/skipped counters, Soroban RPC call and error counts, and process uptime. Read-only; no chain calls or state changes |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
 | `/resume` | Operator only. Schedules the next poll cycle immediately, without changing or replaying cursors |
 | `npm run cursor -- backup` | Backs up the validated cursor file without contacting Stellar or Telegram |
@@ -140,9 +145,11 @@ looks healthy but notifies nobody.
 command metadata used to register handlers. Without `OPERATOR_TELEGRAM_USER_ID`,
 the help and menu omit `/audit`, `/pause`, and `/resume`; configured operator
 commands are labelled "Operator only". Help uses static metadata, so it remains
-available when the poller or RPC is unhealthy. Adding a command requires its
-metadata and handler in `src/bot.ts`; TypeScript checks that every registry entry
-has a handler. This changes no cursor files or deployment settings.
+available when the poller or RPC is unhealthy. Adding a command requires a module
+in `src/commands/`, an import in `src/commands/index.ts`, metadata in `src/i18n.ts`
+and `src/commands/help-detail.ts`, and regenerating `docs/commands.md`; the shared
+registrar applies each module's gates. This changes no cursor files or deployment
+settings.
 
 Commands from a user other than `OPERATOR_TELEGRAM_USER_ID` receive no control
 response and cannot mutate poller state — this includes `/audit`, whose report
@@ -218,7 +225,7 @@ checkout; the Docker image already includes the compiled CLI.
 ```bash
 npm run cursor -- backup
 npm run cursor -- backup --out /safe-storage/cursor-before-deploy.json
-npm run cursor -- restore --from /safe-storage/cursor-before-deploy.json --force
+npm run cursor -- restore --from /safe-storage/cursor-before-deploy.json --force --ack-replay
 npm run cursor -- history
 npm run cursor -- check --archive ./data/archive
 ```
@@ -229,8 +236,12 @@ bot from starting or writing concurrently, and atomically replaces the live
 file. Stop the bot before restoring. A live process holding the lock makes the
 command fail; stale locks are handled by the same PID check used at startup.
 Restoring an existing cursor requires `--force`; malformed or future-version
-files are always rejected. The command prints only paths, schema version, and
-target count, never opaque cursor contents.
+files are always rejected. Pass `--ack-replay` (or `--acknowledge-replay`) when
+restoring an older backup to explicitly acknowledge intended event replay. If an
+older backup is restored without acknowledgement, the poller detects the cursor
+rollback at startup using a monotonic recovery generation and aborts startup
+unless `ACKNOWLEDGE_CURSOR_REPLAY=true` is set. The command prints only paths,
+schema version, and target count, never opaque cursor contents.
 
 Cursor recovery actions (automatic floor rewinds, operator restores, and
 corrupt-file quarantines) append a bounded entry to `recoveryHistory` (at most
@@ -720,12 +731,12 @@ change and must be deployed together with a recorded fixture and an operational
 note. The chain remains authoritative if the bot version cannot decode an event.
 
 RPC configuration is read-only: `STELLAR_RPC_URL` must point to a Soroban RPC
-endpoint, and `STELLAR_NETWORK_PASSPHRASE` controls network labeling for
-explorer links. The client sends no signing material and creates no wallet.
-Explorer path components are URL-encoded; custom `STELLAR_EXPLORER_BASE_URL`
-values are supported without changing cursor or decoder compatibility.
-Notifications only link `https:` URLs; any other explorer or app origin renders
-the `tx` label as inert text (see [docs/notification-links.md](docs/notification-links.md)).
+endpoint without embedded credentials (`user:pass@host` is rejected before
+startup, reporting only the affected configuration key), and
+`STELLAR_NETWORK_PASSPHRASE` controls network labeling for explorer links. The
+client sends no signing material and creates no wallet. Explorer path components
+are URL-encoded; custom `STELLAR_EXPLORER_BASE_URL` values are supported without
+changing cursor or decoder compatibility.
 
 ## Cursor persistence
 
@@ -960,9 +971,12 @@ budget as a normal burst, and the file is bounded on every axis:
 
 Identity is the event, not the attempt: the same event failing twice is one
 entry with two attempts, so a failing cycle cannot fill the queue with
-duplicates. Only the already-formatted message and short operational metadata
-(source, ledger, event name, redacted error) are stored — never a signing key —
-and the file is written write-then-rename, so a crash cannot corrupt it.
+duplicates. A stable opaque correlation ID links the event's scan/delivery logs
+to its parked entry and later replay; it is derived from chain identity metadata,
+not the rendered message or credentials. Only the already-formatted message and
+short operational metadata (source, ledger, event name, correlation ID, redacted
+error) are stored — never a signing key — and the file is written
+write-then-rename, so a crash cannot corrupt it.
 
 Two things it deliberately does not do:
 
@@ -977,19 +991,37 @@ Two things it deliberately does not do:
 `DEAD_LETTER_FILE` disables the queue entirely, and the poller then behaves
 exactly as it did before the queue existed.
 
-Operators can inspect and manage parked entries offline (without contacting
-Stellar or Telegram) via the DLQ CLI:
+## Scheduled digests
 
-```bash
-npm run dlq -- list [--file PATH] [--json]
-npm run dlq -- show <id> [--file PATH] [--json]
-npm run dlq -- ack <id...> [--yes] [--file PATH] [--json]
-npm run dlq -- purge [--older-than <dur>] [--yes] [--file PATH] [--json]
-```
+Set `DIGEST_SCHEDULE` to buffer notifiable events and deliver them as a grouped
+digest on a UTC cadence instead of sending each event immediately:
 
-`ack` accepts an explicit bounded list of up to 100 entry IDs (`DEAD_LETTER_MAX_ACK_IDS`),
-performs a dry run unless `--yes` is passed, atomically removes all matched entries in a
-single write-then-rename, and preserves unmatched entries untouched.
+- `DIGEST_SCHEDULE` — `daily@HH:mm` or `weekly@day HH:mm` (UTC, `day` in
+  `sun`..`sat`). Unset (default) preserves immediate per-event delivery with no
+  digest checkpoint I/O.
+- `DIGEST_CHECKPOINT_FILE` — path to the versioned JSON checkpoint storing
+  pending events and the last completed run timestamp (default
+  `./data/digest-checkpoint.json`).
+- `DIGEST_MAX_PENDING` — maximum pending events retained between scheduled runs
+  (default `200`). When full, the oldest pending events are evicted first so
+  memory and disk usage remain bounded.
+- **Bounded continuation pages** — when a digest exceeds Telegram's 4096-character
+  message limit, `formatDigestPages` splits it deterministically on complete event
+  summaries (repeating the group header when a multi-event group spans pages) and
+  includes `(page/total)` with the stable total event count in every page header.
+
+Restart behavior:
+
+- On startup, the poller restores `lastRunMs` and pending events from
+  `DIGEST_CHECKPOINT_FILE` (truncating to `DIGEST_MAX_PENDING` if the cap
+  shrank). A corrupt or incompatible checkpoint is quarantined beside the live
+  file (`*.corrupt.<timestamp>`) and treated as a clean cold start.
+- If a scheduled boundary was missed while the bot was down, the scheduler
+  flushes the restored pending events once on startup; on a cold start with no
+  prior run, it waits for the next scheduled boundary.
+- Delivery is best-effort (never claiming exactly-once): pending events are
+  cleared only after the Telegram send succeeds, and a failed send keeps them
+  buffered for the next scheduled boundary.
 
 ## Graceful shutdown
 
@@ -1122,6 +1154,7 @@ proxy requirements, secret lifecycle, verification, and rollback steps.
 | `GET` / `HEAD /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped, draining, or degraded (repeated RPC failures or a stale success window). `GET` returns the JSON report (including `poller.paused` and `poller.suppressedLogs`); `HEAD` returns the same status and headers without a response body or full report serialization. |
 | `GET` / `HEAD /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening (`HEAD` omits the response body). |
 | `GET /health/diag` | The same report `/export` produces in the chat, as plain text. `404` when log capture is off. For an operator with host access but no seat in the chat. |
+| `GET /atom` | Opt-in (`ATOM_FEED_ENABLED=true`), read-only Atom 1.0 feed of the most recent decoded events, bounded by `ATOM_FEED_MAX_ENTRIES`. `404` while disabled, `405` for non-GET. Inherits the health listener's bind address and bearer token. See [HTTP endpoints](docs/http-endpoints.md). |
 
 **Container Healthcheck:** A dedicated CLI probe is available for Docker `HEALTHCHECK` or Kubernetes `exec` probes. It reads the same environment variables and exits `0` on success:
 ```bash
@@ -1196,16 +1229,19 @@ Configuration (see `.env.example`):
 - `HEALTH_HOST` — bind address (default `127.0.0.1`; set to `0.0.0.0` for Docker)
 - `HEALTH_PORT` — TCP port (default `8787`; `0` disables)
 - `HEALTH_STALE_MS` — degraded if no successful poll within this window after the first success (default `90000`; `0` disables)
-- `HEALTH_AUTH_TOKEN` — optional bearer token for all health/metrics routes; an Authorization header over 4096 UTF-8 bytes (including `Bearer `) is rejected with the same empty `401` as any malformed value
+- `ATOM_FEED_ENABLED` — enable the read-only `GET /atom` feed (default `false`)
+- `ATOM_FEED_MAX_ENTRIES` — maximum decoded events retained for that feed (default `50`, minimum `1`)
+- `ATOM_FEED_SELF_URL` — optional public https URL used as the feed's self link (default unset)
 - A stale cursor rejection independently makes `GET /health` return `503` until its target scans successfully; `HEALTH_STALE_MS` does not disable this cursor alert.
 - `STARTUP_HEALTH_DEADLINE_MS` — wall-clock budget for retrying the boot RPC `getHealth()` probe (default `30000`; `0` = single attempt)
 - `STARTUP_HEALTH_RETRY_MS` — delay between failed boot RPC health attempts (default `1000`)
 
-Each poll cycle gets a fresh UUID correlation ID. The ID is included in poller
-logs, `/status`, and `/health` so an RPC failure, malformed event, rate-limited
-send, or cycle error can be tied to one bounded cycle. It is not included in
-Telegram messages, persisted cursor data, or carried across a restart; the
-chain remains the source of truth.
+Each poll cycle gets a fresh UUID, reported in `/status` and `/health` for cycle
+diagnostics. Separately, each notification gets a stable opaque event-derived
+correlation ID shared by its delivery logs, send metadata, and (on failure) its
+dead-letter entry and replay logs. The notification ID hashes only source and
+chain identity metadata; it contains no message text or credentials and is not
+added to Telegram messages or cursor data. The chain remains the source of truth.
 
 **Rollback:** set `HEALTH_PORT=0` (or omit the new env keys to keep defaults) and
 redeploy the previous image — the target alert is additive, does not change the

@@ -12,10 +12,10 @@
  * are wall-clock measurements of this process's own `await`, so they are safe to
  * log and to put in `/status`-style output.
  *
- * Dropped samples: observations with a non-finite or negative duration are still
- * counted as requests (so totals stay honest) but their duration is clamped to 0.
- * Each such drop is tallied under a bounded reason counter so operators can see
- * that clamping happened without any unbounded label cardinality.
+ * Observations can optionally be mirrored into a fixed-bucket latency
+ * histogram. Its only series labels are a constant provider identity and the
+ * bounded operation class (`health` / `events` / `other`); the configured RPC
+ * URL — including any query string — is never a label.
  */
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -52,6 +52,43 @@ export interface RpcTimingSummary {
 
 const RPC_OPERATIONS: readonly RpcOperation[] = ["health", "events"];
 
+/**
+ * Stable identity for the one RPC endpoint configured for this process.
+ *
+ * It is intentionally a constant: `STELLAR_RPC_URL` can carry query strings or
+ * operator-specific hosts, neither of which belongs in a metric label. Every
+ * observation is attributed to this identity regardless of the URL used.
+ */
+export const RPC_PROVIDER_ID = "soroban-rpc" as const;
+export type RpcProviderId = typeof RPC_PROVIDER_ID;
+
+/** Bounded operation classes used by the latency histogram. */
+export const RPC_LATENCY_OPERATIONS = ["health", "events", "other"] as const;
+export type RpcLatencyOperation = (typeof RPC_LATENCY_OPERATIONS)[number];
+
+/**
+ * Finite upper bounds (ms) for RPC latency buckets. The final `+Inf` bucket is
+ * emitted by the renderer, not stored here; times beyond 15s (the client's
+ * request timeout) still count, they just land in `+Inf`.
+ */
+export const DEFAULT_RPC_LATENCY_BUCKETS_MS = [
+  5,
+  10,
+  25,
+  50,
+  100,
+  250,
+  500,
+  1_000,
+  5_000,
+  15_000,
+] as const;
+
+/** Minimal sink for latency observations; implemented by {@link RpcLatencyHistogram}. */
+export interface RpcLatencyObserver {
+  observe(operation: unknown, durationMs: number): void;
+}
+
 function emptyOperation(): RpcOperationTiming {
   return { requests: 0, failures: 0, totalMs: 0, minMs: 0, maxMs: 0 };
 }
@@ -72,13 +109,16 @@ export class RpcTiming {
   };
   private readonly drops: Record<RpcDropReason, number> = emptyDrops();
   private readonly clock: () => number;
+  private readonly latency?: RpcLatencyObserver;
 
   /**
    * `clock` defaults to `performance.now()`; tests inject a deterministic
-   * counter so aggregates are asserted exactly, with no real waiting.
+   * counter so aggregates are asserted exactly, with no real waiting. An
+   * optional `latency` sink mirrors each observation into a bounded histogram.
    */
-  constructor(clock: () => number = () => performance.now()) {
+  constructor(clock: () => number = () => performance.now(), latency?: RpcLatencyObserver) {
     this.clock = clock;
+    this.latency = latency;
   }
 
   /** Time one RPC await, recording success or failure, and rethrow on failure. */
@@ -115,6 +155,7 @@ export class RpcTiming {
     aggregate.totalMs += duration;
     if (aggregate.requests === 1 || duration < aggregate.minMs) aggregate.minMs = duration;
     if (duration > aggregate.maxMs) aggregate.maxMs = duration;
+    this.latency?.observe(operation, duration);
   }
 
   summary(): RpcTimingSummary {

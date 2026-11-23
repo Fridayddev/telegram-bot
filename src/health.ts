@@ -24,10 +24,15 @@ import {
   type ConfigProvenance,
 } from "./config.js";
 import type { LogCapture } from "./logger.js";
-import { formatMetricLabels } from "./metrics.js";
+import type { DecodedEvent } from "./stellar/decode.js";
+import { buildAtomFeed } from "./stellar/feed.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
 import { redactText } from "./redact.js";
+import {
+  RpcLatencyHistogram,
+  renderRpcLatencySnapshotLines,
+} from "./stellar/metrics.js";
 
 export interface HealthDeps {
   config: BotConfig;
@@ -38,6 +43,8 @@ export interface HealthDeps {
   now?: () => number;
   /** Optional handler for Telegram webhook mode (POST /telegram-webhook). */
   webhookHandler?: ((req: http.IncomingMessage, res: http.ServerResponse) => void) | undefined;
+  /** Retained decoded events served by the opt-in read-only Atom route. */
+  atomEvents?: (() => readonly DecodedEvent[]) | undefined;
   /**
    * Optional provenance reader for deterministic tests. Defaults to
    * {@link configProvenance}; either way only key names and origins are served.
@@ -671,6 +678,16 @@ export function buildMetricsReport(
     }
   }
 
+  lines.push(
+    ``,
+    ...renderRpcLatencySnapshotLines(
+      poller.rpcLatency ?? new RpcLatencyHistogram().snapshot(),
+      `mimir_telegram_rpc_request_latency_ms`,
+      `RPC latency in milliseconds across fixed buckets by operation`,
+      { network },
+    ),
+  );
+
   return lines.join("\\n") + "\\n";
 }
 
@@ -724,7 +741,7 @@ function sendMethodNotAllowed(res: http.ServerResponse, allow: string): void {
   res.end(payload);
 }
 
-function sendUnauthorized(res: http.ServerResponse): void {
+function sendUnauthorized(res: http.ServerResponse, closing = false): void {
   res.writeHead(401, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
@@ -855,22 +872,43 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
       return;
     }
 
-    if ((method === "GET" || method === "HEAD") && url.pathname === "/") {
-      if (method === "HEAD") {
-        sendHead(res, 200, "application/json; charset=utf-8", closing);
+    if (config.atomFeedEnabled && url.pathname === "/atom") {
+      if (method !== "GET") {
+        res.writeHead(405, {
+          allow: "GET",
+          "cache-control": "no-store",
+          "content-length": "0",
+        });
+        res.end();
         return;
       }
-      sendJson(
-        res,
-        200,
-        {
-          service: "mimir-telegram-bot",
-          health: "/health",
-          live: "/health/live",
-          metrics: "/metrics",
-        },
-        closing,
-      );
+      const cap = config.atomFeedMaxEntries > 0 ? config.atomFeedMaxEntries : 50;
+      const retained = deps.atomEvents?.() ?? [];
+      const events = retained.slice(-cap);
+      const selfUrl =
+        config.atomFeedSelfUrl ?? `http://${config.healthHost}:${config.healthPort}/atom`;
+      const xml = buildAtomFeed(events, {
+        title: `Mimir Events (${networkLabel(config)})`,
+        selfUrl,
+        config,
+      });
+      res.writeHead(200, {
+        "content-type": "application/atom+xml; charset=utf-8",
+        "cache-control": "no-store",
+        "content-length": Buffer.byteLength(xml),
+      });
+      res.end(xml);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/") {
+      sendJson(res, 200, {
+        service: "mimir-telegram-bot",
+        health: "/health",
+        live: "/health/live",
+        metrics: "/metrics",
+        ...(config.atomFeedEnabled ? { atom: "/atom" } : {}),
+      });
       return;
     }
 
@@ -901,6 +939,7 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
   const url = `http://${config.healthHost}:${port}`;
   console.log(
     `[health] listening on ${url} (GET /health, GET /health/live` +
+      `${config.atomFeedEnabled ? ", GET /atom" : ""}` +
       `${logs && logs.capacity() > 0 ? ", GET /health/diag" : ""})`,
   );
 
@@ -916,9 +955,43 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     port,
     beginShutdown,
     isShuttingDown,
-    close: () =>
-      new Promise((resolve, reject) => {
-        server.close((err) => (err ? reject(err) : resolve()));
-      }),
+    close: (options?: HealthCloseOptions) => {
+      if (closePromise !== null) return closePromise;
+      closing = true;
+      const graceMs = resolveShutdownGraceMs(
+        options?.gracePeriodMs,
+        config.healthShutdownGraceMs,
+      );
+
+      closePromise = new Promise((resolve, reject) => {
+        let timer: NodeJS.Timeout | null = null;
+        const clearTimer = (): void => {
+          if (timer !== null) {
+            clearTimeout(timer);
+            timer = null;
+          }
+        };
+
+        server.close((err) => {
+          clearTimer();
+          if (err) reject(err);
+          else resolve();
+        });
+
+        server.closeIdleConnections?.();
+
+        if (graceMs <= 0) {
+          forceDestroySockets();
+        } else if (sockets.size > 0) {
+          timer = setTimeout(() => {
+            timer = null;
+            forceDestroySockets();
+          }, graceMs);
+          timer.unref?.();
+        }
+      });
+
+      return closePromise;
+    },
   };
 }

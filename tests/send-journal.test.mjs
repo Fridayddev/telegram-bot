@@ -11,8 +11,11 @@ import test from "node:test";
 
 import { Address, Keypair, nativeToScVal } from "@stellar/stellar-sdk";
 
-import { sanitizeTelegramError } from "../dist/notifications/notifier.js";
-import { createSendJournal } from "../dist/notifications/send-journal.js";
+import { createNotifier } from "../dist/notifications/notifier.js";
+import {
+  createSendJournal,
+  SEND_JOURNAL_DIAGNOSTIC_MAX_CHARS,
+} from "../dist/notifications/send-journal.js";
 import { createPoller } from "../dist/poller.js";
 import { createTempDataDir } from "./helpers/temp-data.mjs";
 
@@ -243,7 +246,7 @@ test("poller: a crash mid-send leaves an intent without a done, recoverable on r
     await waitFor(async () => {
       if (sendCalls < 1) return false;
       const raw = await readFile(journalFile, "utf8").catch(() => "");
-      return raw.includes('"kind":"intent"');
+      return raw.includes('"kind":"intent"') && sendCalls === 1;
     });
 
     const raw = await readFile(journalFile, "utf8");
@@ -264,92 +267,59 @@ test("poller: a crash mid-send leaves an intent without a done, recoverable on r
   }
 });
 
-// ── Error sanitization and journal persistence ───────────────────────────────
-
-test("sanitizeTelegramError redacts secrets, bounds length, and retains stable errorCode", () => {
-  const secretSeed = "S" + "A".repeat(55);
-  const longSuffix = "x".repeat(300);
-  const err = {
-    error_code: 400,
-    description:
-      `Bad Request:\n  bot${BOT_TOKEN} https://user:pass@rpc.example.invalid/?token=abc ` +
-      `seed=${secretSeed} ${longSuffix}`,
-  };
-
-  const sanitized = sanitizeTelegramError(err, [BOT_TOKEN]);
-  assert.equal(sanitized.errorCode, 400);
-  assert.ok(!sanitized.description.includes(BOT_TOKEN), "bot token must be redacted");
-  assert.ok(!sanitized.description.includes(secretSeed), "secret seed must be redacted");
-  assert.ok(!sanitized.description.includes("user:pass"), "URL userinfo must be redacted");
-  assert.ok(!sanitized.description.includes("\n"), "newlines must be collapsed");
-  assert.ok(sanitized.description.length <= 240, "description must be bounded to 240 chars");
-  assert.ok(sanitized.description.endsWith("…"), "truncated description must end with ellipsis");
-});
-
-test("sanitizeTelegramError handles non-object and missing-description boundary cases", () => {
-  const networkErr = Object.assign(new Error(`connect ETIMEDOUT https://u:p@host.invalid`), {
-    code: "ETIMEDOUT",
-  });
-  const s1 = sanitizeTelegramError(networkErr);
-  assert.equal(s1.errorCode, "ETIMEDOUT");
-  assert.ok(!s1.description.includes("u:p"), "URL credentials in Error.message must be redacted");
-
-  const emptyDesc = sanitizeTelegramError({ error_code: 429, description: "   " });
-  assert.equal(emptyDesc.errorCode, 429);
-  assert.equal(emptyDesc.description, "error code 429");
-
-  const nullErr = sanitizeTelegramError(null);
-  assert.equal(nullErr.errorCode, undefined);
-  assert.equal(nullErr.description, "unknown error");
-});
-
-test("send journal: recordError persists sanitized description, settles intent, and bounds errors on compact", async () => {
-  const dir = await createTempDataDir("mimir-journal-error-");
-  const file = dir.file("journal.jsonl");
+test("poller + notifier: response missing message_id is not confirmed and retains bounded recoverable journal entry", async () => {
+  const dir = await createTempDataDir("mimir-journal-missing-msgid-");
+  const journalFile = dir.file("send-journal.jsonl");
   try {
-    const journal = createSendJournal({
-      filePath: file,
-      maxEntries: 2,
-      maxBytes: 10_000,
-      now: () => 1_700_000_000_000,
-      secrets: [BOT_TOKEN],
-    });
-
-    await journal.recordIntent({
-      id: "evt-fail-1",
-      source: "market",
-      ledger: 6001,
-      eventName: "claim_created",
-      textHash: "hash1",
-      at: 1_700_000_000_000,
-    });
-    await journal.recordError({
-      id: "evt-fail-1",
-      source: "market",
-      ledger: 6001,
-      eventName: "claim_created",
-      error: {
-        error_code: 403,
-        description: `Forbidden: bot${BOT_TOKEN} was blocked by the user ${"z".repeat(300)}`,
+    const fakeBot = {
+      api: {
+        // Simulates a Telegram API / proxy response missing message_id.
+        sendMessage: async () => ({ ok: true }),
       },
+    };
+    const notifier = createNotifier(
+      fakeBot,
+      { chatId: "-1001234567890", botToken: BOT_TOKEN },
+      { requireMessageId: true },
+    );
+
+    const poller = createPoller({
+      config: {
+        ...baseConfig(dir),
+        sendJournalFile: journalFile,
+      },
+      server: makeServer(),
+      send: notifier,
+      ...FAST_SEND,
     });
 
-    // An errored send settles its intent so recovery does not treat it as maybe-sent.
-    assert.deepEqual(await journal.loadPending(), []);
+    await poller.runCycle();
 
-    const raw = await readFile(file, "utf8");
-    assert.ok(!raw.includes(BOT_TOKEN), "raw bot token must never be persisted to journal");
-    const lines = raw.trim().split("\n").map((l) => JSON.parse(l));
-    const errEntry = lines.find((e) => e.kind === "error");
-    assert.ok(errEntry, "error entry should be persisted");
-    assert.equal(errEntry.errorCode, 403);
-    assert.ok(errEntry.errorDescription.length <= 240);
-    assert.ok(errEntry.errorDescription.includes("[REDACTED]"));
+    const status = poller.status();
+    assert.equal(status.notificationsSent, 0, "missing message_id must not count as confirmed send");
+    assert.equal(status.notificationsFailed, 1, "missing message_id must count as failed delivery");
 
-    // Additional errors compact within maxEntries.
-    await journal.recordError({ id: "evt-fail-2", error: { error_code: 429, description: "Too Many Requests" } });
-    await journal.recordError({ id: "evt-fail-3", error: { error_code: 500, description: "Internal Server Error" } });
-    assert.ok((await journal.stats()).entries <= 2, "compaction bounds retained error entries");
+    const raw = await readFile(journalFile, "utf8");
+    assert.ok(raw.includes('"kind":"intent"'), "intent is recorded");
+    assert.ok(!raw.includes('"kind":"done"'), "done must not be recorded");
+
+    const journal = createSendJournal({ filePath: journalFile });
+    const pending = await journal.loadPending();
+    assert.equal(pending.length, 1, "unresolved intent remains recoverable");
+    assert.equal(pending[0].id, "5001-0");
+    assert.match(pending[0].diagnostic ?? "", /message_id/);
+    assert.ok((pending[0].diagnostic ?? "").length <= SEND_JOURNAL_DIAGNOSTIC_MAX_CHARS + 1);
+
+    // Compaction keeps the unresolved entry and its bounded diagnostic, and
+    // recordInvalidResult bounds oversized diagnostics.
+    await journal.recordInvalidResult("5001-0", `overflow-${"x".repeat(500)}`);
+    await journal.compact();
+    const afterCompact = await journal.loadPending();
+    assert.equal(afterCompact.length, 1);
+    assert.ok(
+      (afterCompact[0].diagnostic ?? "").length <= SEND_JOURNAL_DIAGNOSTIC_MAX_CHARS + 1,
+      "diagnostic must remain bounded",
+    );
   } finally {
     await dir.cleanup();
   }

@@ -23,27 +23,37 @@ export type VolumeBucketUnit = "hour" | "day";
 
 export interface VolumeSeriesOptions extends CaptureCompletenessOptions {
   bucket: VolumeBucketUnit;
+  /**
+   * Builds a per-event identity component from a `DecodedEvent`. When omitted,
+   * the key derives from the event's `contractId` and `source`, which is what
+   * separates identical numeric IDs coming from different contracts. Include
+   * the network here if a multi-network feed is ever merged, e.g.
+   * `(e) => `${network}:${e.contractId}:${e.source}``.
+   */
+  identity?: (event: DecodedEvent) => string;
 }
 
-export interface VolumeBucketCheckpointState {
+export interface VolumeBucket {
+  /** UTC ISO string representing the start of the bucket. */
+  timestamp: string;
+  /** Unix timestamp in seconds for the start of the bucket. */
   startAt: number;
-  challengeStake: string;
-  squadDeposit: string;
+  /** Composite identity of the aggregate this bucket belongs to. */
+  identityKey: string;
+  challengeStakeTotal: string;
+  squadDepositTotal: string;
+  challengeStake: bigint;
+  squadDeposit: bigint;
   challengeCount: number;
   depositCount: number;
   eventCount: number;
 }
 
 export interface VolumeSeriesResult {
-  /** Contiguous time buckets (zero-filled) between earliest and latest event, or empty if no valid events. */
   buckets: VolumeBucket[];
-  /** Total challenge stake across all buckets in this captured series as bigint string. */
   totalChallengeStake: string;
-  /** Total squad deposit across all buckets in this captured series as bigint string. */
   totalSquadDeposit: string;
-  /** Count of events skipped due to missing or invalid `at` timestamp. */
   skippedWithoutAt: number;
-  /** Total valid events processed. */
   processedEvents: number;
   /** Capture completeness metadata including ledger range and gap information. */
   completeness: CaptureCompleteness;
@@ -63,16 +73,6 @@ export interface VolumeSeriesResult {
 const SECONDS_PER_HOUR = 3600;
 const SECONDS_PER_DAY = 86400;
 
-export class VolumeSeriesCheckpointError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "VolumeSeriesCheckpointError";
-  }
-}
-
-/**
- * Floor unix timestamp in seconds to the start of the UTC bucket.
- */
 export function floorToBucketUtc(unixSeconds: number, bucket: VolumeBucketUnit): number {
   if (bucket === "hour") {
     return Math.floor(unixSeconds / SECONDS_PER_HOUR) * SECONDS_PER_HOUR;
@@ -80,168 +80,26 @@ export function floorToBucketUtc(unixSeconds: number, bucket: VolumeBucketUnit):
   return Math.floor(unixSeconds / SECONDS_PER_DAY) * SECONDS_PER_DAY;
 }
 
-export function serializeVolumeSeriesCheckpoint(checkpoint: VolumeSeriesCheckpoint): string {
-  return `${JSON.stringify(checkpoint, null, 2)}\n`;
+function defaultIdentity(event: DecodedEvent): string {
+  const contract = typeof event.contractId === "string" ? event.contractId : "";
+  const source = typeof event.source === "string" ? event.source : "";
+  return `${contract}:${source}`;
 }
 
-export function deserializeVolumeSeriesCheckpoint(json: string): VolumeSeriesCheckpoint {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(json);
-  } catch (err) {
-    throw new VolumeSeriesCheckpointError(
-      `Malformed JSON in volume series checkpoint: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new VolumeSeriesCheckpointError("Volume series checkpoint must be a JSON object");
-  }
-
-  const cp = parsed as Partial<VolumeSeriesCheckpoint>;
-  if (cp.format !== VOLUME_SERIES_CHECKPOINT_FORMAT || cp.version !== VOLUME_SERIES_CHECKPOINT_VERSION) {
-    throw new VolumeSeriesCheckpointError(
-      `Incompatible volume series checkpoint format or version (expected ${VOLUME_SERIES_CHECKPOINT_FORMAT} v${VOLUME_SERIES_CHECKPOINT_VERSION}, got format=${String(cp.format)} version=${String(cp.version)})`,
-    );
-  }
-
-  if (cp.bucket !== "hour" && cp.bucket !== "day") {
-    throw new VolumeSeriesCheckpointError(`Invalid bucket unit in checkpoint: ${String(cp.bucket)}`);
-  }
-
-  if (!Array.isArray(cp.buckets)) {
-    throw new VolumeSeriesCheckpointError("Checkpoint buckets must be an array");
-  }
-
-  return {
-    format: VOLUME_SERIES_CHECKPOINT_FORMAT,
-    version: VOLUME_SERIES_CHECKPOINT_VERSION,
-    bucket: cp.bucket,
-    updatedAt: typeof cp.updatedAt === "string" ? cp.updatedAt : new Date().toISOString(),
-    processedEvents: typeof cp.processedEvents === "number" ? Math.max(0, cp.processedEvents) : 0,
-    skippedWithoutAt: typeof cp.skippedWithoutAt === "number" ? Math.max(0, cp.skippedWithoutAt) : 0,
-    totalChallengeStake: typeof cp.totalChallengeStake === "string" ? cp.totalChallengeStake : "0",
-    totalSquadDeposit: typeof cp.totalSquadDeposit === "string" ? cp.totalSquadDeposit : "0",
-    minBucketStart: typeof cp.minBucketStart === "number" ? cp.minBucketStart : null,
-    maxBucketStart: typeof cp.maxBucketStart === "number" ? cp.maxBucketStart : null,
-    buckets: cp.buckets.map((b) => ({
-      startAt: Number(b.startAt),
-      challengeStake: String(b.challengeStake ?? "0"),
-      squadDeposit: String(b.squadDeposit ?? "0"),
-      challengeCount: Number(b.challengeCount ?? 0),
-      depositCount: Number(b.depositCount ?? 0),
-      eventCount: Number(b.eventCount ?? 0),
-    })),
-    recentEventIds: Array.isArray(cp.recentEventIds)
-      ? cp.recentEventIds.filter((id): id is string => typeof id === "string")
-      : [],
-    lastProcessedEventId: typeof cp.lastProcessedEventId === "string" ? cp.lastProcessedEventId : null,
-    dedupCapacity: typeof cp.dedupCapacity === "number" ? cp.dedupCapacity : DEFAULT_DEDUP_WINDOW,
-  };
-}
-
-export async function saveVolumeSeriesCheckpoint(
-  filePath: string,
-  checkpoint: VolumeSeriesCheckpoint,
-): Promise<void> {
-  const dir = path.dirname(filePath);
-  await mkdir(dir, { recursive: true });
-  const tmp = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-  try {
-    await writeFile(tmp, serializeVolumeSeriesCheckpoint(checkpoint), "utf8");
-    await rename(tmp, filePath);
-  } catch (err) {
-    try {
-      await unlink(tmp);
-    } catch {}
-    throw err;
-  }
-}
-
-export async function loadVolumeSeriesCheckpoint(
-  filePath: string,
-): Promise<VolumeSeriesCheckpoint | null> {
-  let content: string;
-  try {
-    content = await readFile(filePath, "utf8");
-  } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      return null;
-    }
-    throw new VolumeSeriesCheckpointError(
-      `Cannot read volume series checkpoint file "${filePath}": ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-
-  try {
-    return deserializeVolumeSeriesCheckpoint(content);
-  } catch (err) {
-    if (err instanceof VolumeSeriesCheckpointError) {
-      throw new VolumeSeriesCheckpointError(`In checkpoint file "${filePath}": ${err.message}`);
-    }
-    throw err;
-  }
-}
-
-interface IntermediateBucket {
-  startAt: number;
-  challengeStake: bigint;
-  squadDeposit: bigint;
-  challengeCount: number;
-  depositCount: number;
-  eventCount: number;
-}
-
-/**
- * Incremental, checkpointable reducer for time-bucketed volume series.
- *
- * Empty buckets between earliest and latest events are filled with zero values.
- * Events without a valid `at` timestamp are skipped and counted in `skippedWithoutAt`.
- * Annotates results with capture completeness metadata (ledger range and gaps).
- * Partial captures keep `globalMarketTotals: null` to prevent presenting partial captures
- * as global market totals.
- */
-export class VolumeSeriesReducer {
-  readonly bucketUnit: VolumeBucketUnit;
-  readonly dedupCapacity: number;
-  private readonly maxBuckets?: number;
-  private readonly dedup: EventDedupWindow;
-  private readonly checkpointDedup = new Set<string>();
-  private readonly isResuming: boolean;
-  private readonly enableDedup: boolean;
-  private bucketMap = new Map<number, IntermediateBucket>();
-  private minBucketStart: number | null = null;
-  private maxBucketStart: number | null = null;
-  private totalChallengeStakeBigInt = 0n;
-  private totalSquadDepositBigInt = 0n;
-  private skippedWithoutAt = 0;
-  private processedEvents = 0;
-  private resumedDuplicates = 0;
-  private lastProcessedEventId: string | null = null;
-  private readonly hadInitialCheckpoint: boolean;
-
-  constructor(options: VolumeSeriesOptions) {
-    const bucketUnit = options?.bucket;
-    if (bucketUnit !== "hour" && bucketUnit !== "day") {
-      throw new Error(`Invalid bucket unit: expected "hour" or "day", got ${String(bucketUnit)}`);
-    }
-    this.bucketUnit = bucketUnit;
-    this.dedupCapacity = options?.dedupCapacity ?? DEFAULT_DEDUP_WINDOW;
-    this.dedup = new EventDedupWindow(this.dedupCapacity);
-    this.maxBuckets = options?.maxBuckets;
-    this.hadInitialCheckpoint = Boolean(options?.checkpoint);
-    this.isResuming = Boolean(options?.checkpoint);
-    this.enableDedup = options?.dedup ?? this.isResuming;
-
-    if (options?.checkpoint) {
-      this.restoreCheckpoint(options.checkpoint);
-    }
+export function volumeSeries(
+  events: readonly DecodedEvent[] | null | undefined,
+  options: VolumeSeriesOptions,
+): VolumeSeriesResult {
+  const bucketUnit = options?.bucket;
+  if (bucketUnit !== "hour" && bucketUnit !== "day") {
+    throw new Error(`Invalid bucket unit: expected "hour" or "day", got ${String(bucketUnit)}`);
   }
 
   // Derive capture completeness metadata (and enforce requireComplete if requested)
   const completeness = computeCaptureCompleteness(events, options);
 
   const stepSeconds = bucketUnit === "hour" ? SECONDS_PER_HOUR : SECONDS_PER_DAY;
+  const identityOf = options.identity ?? defaultIdentity;
 
     this.minBucketStart = cp.minBucketStart;
     this.maxBucketStart = cp.maxBucketStart;
@@ -301,28 +159,24 @@ export class VolumeSeriesReducer {
     return emptyResult;
   }
 
-  /**
-   * Ingest a single decoded event.
-   *
-   * Returns true if processed as a new event, false if dropped as a duplicate
-   * or skipped due to invalid structure.
-   */
-  addEvent(event: DecodedEvent): boolean {
-    if (!event || typeof event !== "object") {
-      return false;
-    }
+  interface IntermediateBucket {
+    identityKey: string;
+    startAt: number;
+    challengeStake: bigint;
+    squadDeposit: bigint;
+    challengeCount: number;
+    depositCount: number;
+    eventCount: number;
+  }
 
-    const key = eventKey(event as DedupableEvent);
-    if (key !== null) {
-      if (this.isResuming && (this.checkpointDedup.has(key) || (this.lastProcessedEventId !== null && key === this.lastProcessedEventId))) {
-        this.resumedDuplicates++;
-        return false;
-      }
-      if (this.enableDedup && this.dedup.has(key)) {
-        this.resumedDuplicates++;
-        return false;
-      }
-    }
+  const bucketMap = new Map<string, IntermediateBucket>();
+  const minByKey = new Map<string, number>();
+  const maxByKey = new Map<string, number>();
+  let totalChallengeStakeBigInt = 0n;
+  let totalSquadDepositBigInt = 0n;
+
+  for (const event of events) {
+    if (!event || typeof event !== "object") continue;
 
     const at = (event as { at?: unknown }).at;
     if (typeof at !== "number" || !Number.isFinite(at) || at < 0) {
@@ -335,13 +189,7 @@ export class VolumeSeriesReducer {
     }
 
     const payload = (event as { payload?: unknown }).payload;
-    if (!payload || typeof payload !== "object") {
-      if (key !== null) {
-        this.dedup.add(key);
-        this.lastProcessedEventId = key;
-      }
-      return false;
-    }
+    if (!payload || typeof payload !== "object") continue;
 
     const payloadName = (payload as { name?: unknown }).name;
 
@@ -366,32 +214,27 @@ export class VolumeSeriesReducer {
       isDeposit = true;
     }
 
-    this.processedEvents++;
-    if (key !== null) {
-      this.dedup.add(key);
-      this.lastProcessedEventId = key;
-    }
+    processedEvents++;
+
+    const identityKey = identityOf(event as DecodedEvent);
+    const bucketStart = floorToBucketUtc(Math.floor(at), bucketUnit);
+    const compositeKey = `${identityKey}:${bucketStart}`;
+
+    const prevMin = minByKey.get(identityKey);
+    if (prevMin === undefined || bucketStart < prevMin) minByKey.set(identityKey, bucketStart);
+    const prevMax = maxByKey.get(identityKey);
+    if (prevMax === undefined || bucketStart > prevMax) maxByKey.set(identityKey, bucketStart);
 
     const bucketStart = floorToBucketUtc(Math.floor(at), this.bucketUnit);
 
-    if (this.minBucketStart === null || bucketStart < this.minBucketStart) {
-      this.minBucketStart = bucketStart;
-    }
-    if (this.maxBucketStart === null || bucketStart > this.maxBucketStart) {
-      this.maxBucketStart = bucketStart;
-    }
-
-    this.totalChallengeStakeBigInt += challengeStakeDelta;
-    this.totalSquadDepositBigInt += squadDepositDelta;
-
-    let existing = this.bucketMap.get(bucketStart);
+    let existing = bucketMap.get(compositeKey);
     if (!existing) {
       existing = {
         identityKey, startAt: bucketStart,
         challengeStake: 0n, squadDeposit: 0n,
         challengeCount: 0, depositCount: 0, eventCount: 0,
       };
-      this.bucketMap.set(bucketStart, existing);
+      bucketMap.set(compositeKey, existing);
     }
 
     existing.challengeStake += challengeStakeDelta;
@@ -414,114 +257,28 @@ export class VolumeSeriesReducer {
     return true;
   }
 
-  addEvents(events: readonly DecodedEvent[] | null | undefined): {
-    processed: number;
-    duplicates: number;
-    skippedWithoutAt: number;
-  } {
-    if (!events || !Array.isArray(events)) {
-      return { processed: 0, duplicates: 0, skippedWithoutAt: 0 };
+  const buckets: VolumeBucket[] = [];
+  for (const [identityKey, minStart] of minByKey) {
+    const maxStart = maxByKey.get(identityKey)!;
+    for (let t = minStart; t <= maxStart; t += stepSeconds) {
+      const data = bucketMap.get(`${identityKey}:${t}`);
+      buckets.push({
+        timestamp: new Date(t * 1000).toISOString(),
+        startAt: t,
+        identityKey,
+        challengeStakeTotal: (data ? data.challengeStake : 0n).toString(),
+        squadDepositTotal: (data ? data.squadDeposit : 0n).toString(),
+        challengeStake: data ? data.challengeStake : 0n,
+        squadDeposit: data ? data.squadDeposit : 0n,
+        challengeCount: data ? data.challengeCount : 0,
+        depositCount: data ? data.depositCount : 0,
+        eventCount: data ? data.eventCount : 0,
+      });
     }
-    const prevProcessed = this.processedEvents;
-    const prevDuplicates = this.resumedDuplicates;
-    const prevSkipped = this.skippedWithoutAt;
-
-    for (const ev of events) {
-      this.addEvent(ev);
-    }
-
-    return {
-      buckets: [],
-      totalChallengeStake: "0",
-      totalSquadDeposit: "0",
-      skippedWithoutAt,
-      processedEvents,
-      completeness,
-      capture: completeness,
-      globalMarketTotals: completeness.isComplete
-        ? { totalChallengeStake: "0", totalSquadDeposit: "0" }
-        : null,
-    };
-  }
-
-  toCheckpoint(): VolumeSeriesCheckpoint {
-    const buckets: VolumeBucketCheckpointState[] = Array.from(this.bucketMap.values())
-      .sort((a, b) => a.startAt - b.startAt)
-      .map((b) => ({
-        startAt: b.startAt,
-        challengeStake: b.challengeStake.toString(),
-        squadDeposit: b.squadDeposit.toString(),
-        challengeCount: b.challengeCount,
-        depositCount: b.depositCount,
-        eventCount: b.eventCount,
-      }));
-
-    return {
-      format: VOLUME_SERIES_CHECKPOINT_FORMAT,
-      version: VOLUME_SERIES_CHECKPOINT_VERSION,
-      bucket: this.bucketUnit,
-      updatedAt: new Date().toISOString(),
-      processedEvents: this.processedEvents,
-      skippedWithoutAt: this.skippedWithoutAt,
-      totalChallengeStake: this.totalChallengeStakeBigInt.toString(),
-      totalSquadDeposit: this.totalSquadDepositBigInt.toString(),
-      minBucketStart: this.minBucketStart,
-      maxBucketStart: this.maxBucketStart,
-      buckets,
-      recentEventIds: this.dedup.toJSON(),
-      lastProcessedEventId: this.lastProcessedEventId,
-      dedupCapacity: this.dedupCapacity,
-    };
   }
   buckets.sort((a, b) =>
     a.identityKey < b.identityKey ? -1 : a.identityKey > b.identityKey ? 1 : a.startAt - b.startAt,
   );
-
-  toResult(options?: { includeCheckpoint?: boolean }): VolumeSeriesResult {
-    const stepSeconds = this.bucketUnit === "hour" ? SECONDS_PER_HOUR : SECONDS_PER_DAY;
-    const buckets: VolumeBucket[] = [];
-
-    if (this.minBucketStart !== null && this.maxBucketStart !== null) {
-      for (let t = this.minBucketStart; t <= this.maxBucketStart; t += stepSeconds) {
-        const data = this.bucketMap.get(t);
-        const challengeStake = data ? data.challengeStake : 0n;
-        const squadDeposit = data ? data.squadDeposit : 0n;
-        const challengeCount = data ? data.challengeCount : 0;
-        const depositCount = data ? data.depositCount : 0;
-        const eventCount = data ? data.eventCount : 0;
-
-        buckets.push({
-          timestamp: new Date(t * 1000).toISOString(),
-          startAt: t,
-          challengeStakeTotal: challengeStake.toString(),
-          squadDepositTotal: squadDeposit.toString(),
-          challengeStake,
-          squadDeposit,
-          challengeCount,
-          depositCount,
-          eventCount,
-        });
-      }
-    }
-
-    const baseResult: VolumeSeriesResult = {
-      buckets,
-      totalChallengeStake: this.totalChallengeStakeBigInt.toString(),
-      totalSquadDeposit: this.totalSquadDepositBigInt.toString(),
-      skippedWithoutAt: this.skippedWithoutAt,
-      processedEvents: this.processedEvents,
-    };
-
-    if (options?.includeCheckpoint || this.hadInitialCheckpoint) {
-      baseResult.checkpoint = this.toCheckpoint();
-      baseResult.resumedDuplicates = this.resumedDuplicates;
-    }
-
-    return baseResult;
-  }
-
-  const totalChallengeStakeStr = totalChallengeStakeBigInt.toString();
-  const totalSquadDepositStr = totalSquadDepositBigInt.toString();
 
   return {
     buckets,

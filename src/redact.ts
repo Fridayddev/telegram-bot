@@ -15,15 +15,56 @@
  * the one rule that must not apply here: the audit trail replaces any ≥40-char
  * opaque token, which is right for a trail that is meant to be pasted into an
  * issue, but wrong for error text, where a transaction hash or a resume cursor
- * is the most useful part of the message. Everything else — URL userinfo,
- * secret-shaped path segments, repeated or array-style credential query
- * parameters, URL fragments, bearer tokens, and `token=…`/`authorization: …`
- * pairs — is scrubbed, and the result is length bounded so a hostile endpoint
- * cannot write an unbounded blob into a log line or a health response.
+ * is the most useful part of the message. Everything else — the Telegram token,
+ * secret strkeys, URL userinfo and credential-bearing query strings, and
+ * `token=…`/`authorization: …` pairs — is scrubbed, and the result is length
+ * bounded so a hostile endpoint cannot write an unbounded blob into a log line
+ * or a health response.
+ *
+ * Destination identifiers (Telegram chat ids and topic/thread ids) are
+ * redacted from public diagnostics by `redactDestination`, which keeps only a
+ * short, non-reversible fingerprint so distinct topics within one chat remain
+ * distinguishable to operators without revealing the raw identifiers.
  */
 
 /** Placeholder, matching the wording the status/health surfaces already use. */
 export const REDACTED = "[REDACTED]";
+
+/**
+ * Terminal escape and control sequence patterns:
+ *  - OSC (`ESC ] ... BEL/ST` or 8-bit `0x9d ...`), including unterminated OSC
+ *  - DCS/SOS/PM/APC control strings (`ESC P/X/^/_ ... ST` or 8-bit equivalents)
+ *  - CSI / ANSI sequences (`ESC [ ... final` or 8-bit `0x9b ...`)
+ *  - 2-byte / nF ESC sequences (`ESC ... final`, e.g. `ESC c` terminal reset)
+ *  - Remaining C0/C1 control characters except `\t` (0x09) and `\n` (0x0a)
+ *
+ * Ordinary Unicode (accented Latin, CJK, Arabic, Hebrew, emoji, punctuation)
+ * sits at U+00A0 and above and is preserved verbatim.
+ */
+const TERMINAL_ESCAPE_PATTERN = new RegExp(
+  [
+    // OSC (Operating System Command): ESC ] ... (BEL | ST | end)
+    "(?:\\x1b\\]|\\x9d)[^\\x07\\x1b\\x9c]*(?:\\x07|\\x1b\\\\|\\x9c|$)",
+    // DCS, SOS, PM, APC control strings: ESC P/X/^/_ ... (ST | end)
+    "(?:\\x1b[PX^_]|[\\x90\\x98\\x9e\\x9f])[^\\x1b\\x9c]*(?:\\x1b\\\\|\\x9c|$)",
+    // CSI (Control Sequence Introducer): ESC [ params intermediates final?
+    "(?:\\x1b\\[|\\x9b)[\\x30-\\x3f]*[\\x20-\\x2f]*[\\x40-\\x7e]?",
+    // Other ESC sequences (e.g. ESC c, ESC ( B)
+    "\\x1b[\\x20-\\x2f]*[\\x30-\\x7e]",
+    // Remaining C0/C1 controls except tab (\x09) and newline (\x0a)
+    "[\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f]",
+  ].join("|"),
+  "g",
+);
+
+/**
+ * Strip ANSI/CSI, OSC, and other terminal control sequences from untrusted text
+ * while preserving ordinary Unicode content, tabs, and newlines.
+ */
+export function stripTerminalEscapes(input: string): string {
+  if (!input) return "";
+  return input.replace(TERMINAL_ESCAPE_PATTERN, "");
+}
 
 /**
  * Default cap for redacted error text. Matches `safeErrorMessage`'s historical
@@ -63,6 +104,67 @@ export function registeredSecrets(): string[] {
 /** Test helper — clears the registry between cases. */
 export function clearSecrets(): void {
   registered.clear();
+}
+
+/**
+ * Privacy review mode for shareable event archives. Detects private chat
+ * identifiers and secret-shaped values in a text payload and produces a
+ * deterministic findings report. Pure: no network, no I/O.
+ */
+export interface PrivacyFinding {
+  kind: "telegram_chat_id" | "secret";
+  rule: string;
+  offset: number;
+  length: number;
+  preview: string;
+}
+
+export interface PrivacyReport {
+  ok: boolean;
+  count: number;
+  findings: PrivacyFinding[];
+}
+
+const PRIVACY_RULES: readonly { kind: PrivacyFinding["kind"]; rule: string; pattern: RegExp }[] = [
+  // Private chat ids: negative group/supergroup ids and large positive user ids.
+  { kind: "telegram_chat_id", rule: "chat_id_negative", pattern: /(?<![\w-])-100\d{7,}\b/g },
+  { kind: "telegram_chat_id", rule: "chat_id_positive", pattern: /(?<![\w.-])\d{9,12}(?![\w.-])/g },
+  { kind: "secret", rule: "telegram_bot_token", pattern: /\b\d{6,}:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g },
+  { kind: "secret", rule: "stellar_seed", pattern: /\bS[A-Z2-7]{55}\b/g },
+  { kind: "secret", rule: "bearer_token", pattern: /\bBearer\s+[A-Za-z0-9._+/=-]{8,}/gi },
+  { kind: "secret", rule: "url_userinfo", pattern: /\bhttps?:\/\/[^/\s:@]+:[^/\s@]+@/gi },
+];
+
+function previewOf(value: string): string {
+  if (value.length <= 4) return "****";
+  return `${value.slice(0, 2)}…${value.slice(-2)}`;
+}
+
+/**
+ * Scan text for private chat identifiers and secret-shaped values. Findings are
+ * sorted by offset then rule so the report is deterministic. Matches are
+ * previewed, never echoed in full.
+ */
+export function privacyReview(input: string): PrivacyReport {
+  const findings: PrivacyFinding[] = [];
+  if (input) {
+    for (const { kind, rule, pattern } of PRIVACY_RULES) {
+      for (const match of input.matchAll(pattern)) {
+        const value = match[0];
+        findings.push({
+          kind,
+          rule,
+          offset: match.index ?? 0,
+          length: value.length,
+          preview: previewOf(value),
+        });
+      }
+    }
+  }
+  findings.sort((a, b) =>
+    a.offset - b.offset || a.rule.localeCompare(b.rule) || a.length - b.length
+  );
+  return { ok: findings.length === 0, count: findings.length, findings };
 }
 
 /**
@@ -561,12 +663,51 @@ export function redactText(input: string, options: RedactOptions = {}): string {
   });
 
   for (const rule of ERROR_REDACTION_RULES) {
-    out = typeof rule.replacement === "string"
-      ? out.replace(rule.pattern, rule.replacement)
-      : out.replace(rule.pattern, rule.replacement);
+    out = out.replace(rule.pattern, rule.replacement as never);
   }
 
   return clamp(out, options.maxLen);
+}
+
+/**
+ * Public diagnostic label for a Telegram destination (chat id, optional topic /
+ * message-thread id). Raw ids are never printed. Instead a short, stable,
+ * non-reversible fingerprint is produced per component, so two different topics
+ * in the same chat render differently while the chat and topic themselves stay
+ * unrecoverable from the output.
+ *
+ * Format: `chat:<fp>` or `chat:<fp>/topic:<fp>`. The fingerprint is a 32-bit
+ * FNV-1a hash rendered in hex; it is for distinguishing, not for security, and
+ * the ids are low-entropy enough that operators correlating against their own
+ * config still get a match via `fingerprint`.
+ */
+export function redactDestination(chatId: string | number, topicId?: string | number | null): string {
+  const chat = `chat:${fingerprint(String(chatId))}`;
+  if (topicId === undefined || topicId === null || String(topicId) === "") return chat;
+  return `${chat}/topic:${fingerprint(String(topicId))}`;
+}
+
+/**
+ * Format a Telegram destination (chat id plus optional topic/thread id) for an
+ * operator route diagnostic line. Identifiers are fingerprinted, never printed.
+ */
+export function describeRoute(chatId: string | number, topicId?: string | number | null): string {
+  return redactDestination(chatId, topicId);
+}
+
+/** Reference to a route for diagnostics, identifiers fingerprinted. */
+export function routeLabel(chatId: string | number, topicId?: string | number | null): string {
+  return describeRoute(chatId, topicId);
+}
+
+/** Stable 8-hex-char FNV-1a fingerprint of a string. Not reversible to the input. */
+export function fingerprint(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
 }
 
 /** Redacted, bounded text for anything thrown at us. */
