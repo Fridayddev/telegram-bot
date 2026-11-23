@@ -101,16 +101,7 @@ import {
   formatPlainTextEvent,
   safeErrorMessage,
 } from "./notifications/format.js";
-import {
-  createDigestCheckpoint,
-  DEFAULT_DIGEST_MAX_PENDING,
-  type DigestCheckpoint,
-} from "./notifications/digest-checkpoint.js";
-import {
-  createScheduler,
-  type Scheduler,
-  type SchedulerClock,
-} from "./notifications/schedule.js";
+import { notificationCorrelationId } from "./notifications/correlation.js";
 import { formatSuppressedRepeats, LogSampler } from "./log-sampler.js";
 import { Logger } from "./logger.js";
 import { isNotificationAllowed } from "./notifications/featureFlags.js";
@@ -2816,8 +2807,7 @@ export function createPoller(deps: PollerDeps) {
 
   async function notify(
     events: DecodedEvent[],
-    correlationId: string,
-    ingested: NotificationIngestionMark = notificationAge.markIngested(now()),
+    cycleCorrelationId: string,
   ): Promise<NotificationResult> {
     let sentThisCycle = 0;
     let failed = 0;
@@ -2826,6 +2816,7 @@ export function createPoller(deps: PollerDeps) {
     let capLogged = false;
 
     for (const event of events) {
+      const correlationId = notificationCorrelationId(event);
       metrics?.eventsDecoded.inc();
       categoryCounter.record(event);
 
@@ -2837,7 +2828,7 @@ export function createPoller(deps: PollerDeps) {
         const adminPart = adminAudit?.admin ? ` admin=${boundedLabel(adminAudit.admin, 56)}` : "";
         console.log(
           `[poller] logged admin event "${boundedLabel(event.payload.name, 80)}"${adminPart} ` +
-            `at ledger ${event.ledger}`,
+            `at ledger ${event.ledger} correlation=${correlationId}`,
         );
         continue;
       }
@@ -2873,7 +2864,7 @@ export function createPoller(deps: PollerDeps) {
         skipped += 1;
         console.log(
           `[poller] feature-flag skipped ${event.source} event "${boundedLabel(event.payload.name, 80)}" ` +
-            `at ledger ${event.ledger} (NOTIFY_* flags)`,
+            `at ledger ${event.ledger} (NOTIFY_* flags) correlation=${correlationId}`,
         );
         continue;
       }
@@ -2901,18 +2892,17 @@ export function createPoller(deps: PollerDeps) {
           // once, only when Telegram rejects the entities. Cursor accounting
           // below is unchanged: either path counts as sent, neither as skipped.
           const plainText = formatPlainTextEvent(config, event);
-          const eventRef = { eventId: event.eventId, ledger: event.ledger, source: event.source };
-          const eventCategory =
-            "category" in event.payload &&
-            typeof event.payload.category === "string" &&
-            event.payload.category.trim() !== ""
-              ? event.payload.category
-              : undefined;
+          const eventRef = {
+            eventId: event.eventId,
+            ledger: event.ledger,
+            source: event.source,
+            correlationId,
+          };
           extra = {
             eventName: event.payload.name,
-            ...(eventCategory ? { category: eventCategory } : {}),
+            eventRef,
             ...(reply_markup ? { reply_markup } : {}),
-            ...(plainText !== null ? { plainText, eventRef } : {}),
+            ...(plainText !== null ? { plainText } : {}),
           };
         }
       } catch (err) {
@@ -2922,9 +2912,11 @@ export function createPoller(deps: PollerDeps) {
         Logger.error(
           "poller",
           `[poller] format failed for ${event.source} event at ledger ${event.ledger}: ` +
-            errorMessage(err),
+            `${errorMessage(err)} correlation=${correlationId}`,
           {
             action: "format_failed",
+            correlationId,
+            cycleCorrelationId,
             eventId: event.eventId,
             source: event.source,
             ledger: event.ledger,
@@ -2987,6 +2979,8 @@ export function createPoller(deps: PollerDeps) {
             droppedEvent: event.payload.name,
             source: event.source,
             ledger: event.ledger,
+            correlationId,
+            cycleCorrelationId,
           },
         );
         continue;
@@ -3052,6 +3046,20 @@ export function createPoller(deps: PollerDeps) {
         metrics?.recordNotificationAge(ageMs);
         status.notificationAge = notificationAge.summary();
         sentThisCycle += 1;
+        Logger.debug(
+          "poller",
+          `[poller] notification sent ${event.source} ${event.payload.name} ` +
+            `at ledger ${event.ledger} correlation=${correlationId}`,
+          {
+            action: "notification_sent",
+            correlationId,
+            cycleCorrelationId,
+            eventId: event.eventId,
+            eventName: event.payload.name,
+            source: event.source,
+            ledger: event.ledger,
+          },
+        );
         if (sendJournal) {
           try {
             await sendJournal.recordDone(event.eventId);
@@ -3089,12 +3097,22 @@ export function createPoller(deps: PollerDeps) {
           (event.source === "market" ? config.marketChatId : config.squadChatId) ||
           config.chatId ||
           config.chatIds?.[0];
-        const permanentReason = classifyPermanentSendError(err);
-        console.error(
+        Logger.error(
+          "poller",
           `[poller] send failed for ${event.payload.name} at ledger ${event.ledger}` +
             `${chat ? ` to chat ${chat}` : ""}` +
             `${permanentReason ? ` (reason=${permanentReason})` : " after retries"}: ` +
             `${errorMessage(err)} correlation=${correlationId}`,
+          {
+            action: "notification_send_failed",
+            correlationId,
+            cycleCorrelationId,
+            eventId: event.eventId,
+            eventName: event.payload.name,
+            source: event.source,
+            ledger: event.ledger,
+            error: errorMessage(err),
+          },
         );
         if (isForumTopicClosed(err)) {
           // Permanent route failure: the topic is closed or deleted. Retrying
@@ -3109,6 +3127,7 @@ export function createPoller(deps: PollerDeps) {
           );
         } else if (deadLetterEnabled) {
           await deadLetter.enqueue({
+            correlationId,
             source: event.source,
             ledger: event.ledger,
             eventName: event.payload.name,
@@ -3149,7 +3168,14 @@ export function createPoller(deps: PollerDeps) {
     try {
       const flushed = await deadLetter.flush(async (text, entry) => {
         await sendWithRetry(
-          (message) => send(message, entry.source as ContractSource),
+          (message) =>
+            send(message, entry.source as ContractSource, {
+              eventRef: {
+                source: entry.source,
+                ledger: entry.ledger,
+                correlationId: entry.correlationId,
+              },
+            }),
           text,
           config.botToken,
           sendOptions,

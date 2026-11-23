@@ -51,7 +51,12 @@ export interface SendExtra {
   /**
    * Bounded identifiers for fallback logging only. Optional; never sent.
    */
-  eventRef?: { eventId?: string | undefined; ledger?: number | undefined; source?: string | undefined } | undefined;
+  eventRef?: {
+    eventId?: string | undefined;
+    ledger?: number | undefined;
+    source?: string | undefined;
+    correlationId?: string | undefined;
+  } | undefined;
   /**
    * Post the notification as a reply to this message, for chats that thread
    * their notifications. Optional: omitted from the payload entirely when
@@ -136,6 +141,9 @@ function _eventRefLabel(eventRef: SendExtra["eventRef"]): string {
     parts.push(`ledger ${eventRef.ledger}`);
   }
   if (typeof eventRef.eventId === "string" && eventRef.eventId) parts.push(eventRef.eventId);
+  if (typeof eventRef.correlationId === "string" && eventRef.correlationId) {
+    parts.push(`correlation ${eventRef.correlationId}`);
+  }
   return parts.length > 0 ? ` (${parts.join(" ")})` : "";
 }
 
